@@ -28,69 +28,37 @@ async function callGroq(messages, maxTokens = 1000, temperature = 0.3) {
 
 async function fetchSubreddit(subreddit) {
   try {
-    const res = await fetch(
-      `https://www.reddit.com/r/${subreddit}/new.rss`,
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; Kairo/1.0)',
-          'Accept': 'application/atom+xml, application/xml, text/xml',
-        },
-        signal: AbortSignal.timeout(8000),
-      }
-    )
+    const res = await fetch(`/api/reddit?sub=${encodeURIComponent(subreddit)}&sort=new`)
     if (!res.ok) return []
-    const text = await res.text()
+    const xml = await res.text()
+    if (!xml.includes('<entry>')) return []
 
     const posts = []
-    const entryRegex = /<entry>([\s\S]*?)<\/entry>/g
-    let match
+    const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)]
 
-    while ((match = entryRegex.exec(text)) !== null) {
-      const entry = match[1]
-      const title = entry.match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1]?.replace(/<!\[CDATA\[(.*?)\]\]>/, '$1') || ''
-      const link = entry.match(/<link[^>]*href="([^"]*)"[^>]*\/>/)?.[1] || entry.match(/<id>([\s\S]*?)<\/id>/)?.[1] || ''
-      const content = entry.match(/<content[^>]*>([\s\S]*?)<\/content>/)?.[1] || ''
-      const published = entry.match(/<published>([\s\S]*?)<\/published>/)?.[1] || ''
+    for (const m of entries) {
+      const entry = m[1]
+      const title = (entry.match(/<title[^>]*>([\s\S]*?)<\/title>/) || [])[1]
+        ?.replace(/<!\[CDATA\[|\]\]>/g, '')?.trim() ?? ''
+      const link = (entry.match(/<link[^>]*href="([^"]+)"/) || [])[1]?.trim() ?? ''
+      const content = (entry.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1]
+        ?.replace(/<!\[CDATA\[|\]\]>/g, '')
+        ?.replace(/<[^>]+>/g, ' ')
+        ?.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        ?.replace(/\s+/g, ' ').trim().slice(0, 300) ?? ''
+      const published = (entry.match(/<published>([\s\S]*?)<\/published>/) || [])[1] || ''
 
-      const cleanContent = content
-    .replace(/<table[\s\S]*?<\/table>/gi, '')
-    .replace(/<div[^>]*>/gi, '')
-    .replace(/<\/div>/gi, '')
-    .replace(/<p>/gi, '')
-    .replace(/<\/p>/gi, ' ')
-    .replace(/<br\s*\/?>/gi, ' ')
-    .replace(/<span[^>]*>/gi, '')
-    .replace(/<\/span>/gi, '')
-    .replace(/<a[^>]*>/gi, '')
-    .replace(/<\/a>/gi, '')
-    .replace(/<img[^>]*>/gi, '')
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '')
-    .replace(/&gt;/g, '')
-    .replace(/&#39;/g, "'")
-    .replace(/&quot;/g, '"')
-    .replace(/&#32;/g, ' ')
-    .replace(/&[^;]+;/g, ' ')
-    .replace(/SC_OFF|SC_ON/g, '')
-    .replace(/submitted by/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 400)
+      if (!title || !link.includes('/comments/')) continue
 
-      const createdAt = published ? new Date(published).getTime() : Date.now()
-
-      if (title && link) {
-        posts.push({
-          id: link.split('/').filter(Boolean).pop() || Math.random().toString(36).slice(2),
-          title: title.trim(),
-          body: cleanContent,
-          url: link.trim(),
-          subreddit,
-          createdAt,
-          ups: 0,
-        })
-      }
+      posts.push({
+        id: link.split('/').filter(Boolean).pop() || Math.random().toString(36).slice(2),
+        title: title.trim(),
+        body: content,
+        url: link.trim(),
+        subreddit,
+        createdAt: published ? new Date(published).getTime() : Date.now(),
+        ups: 0,
+      })
     }
 
     return posts
