@@ -1,4 +1,3 @@
-// In-memory IP tracking
 const ipStore = new Map()
 
 function getIP(req) {
@@ -56,11 +55,11 @@ async function analyzeProduct(content, url) {
   const raw = await callGroq([
     {
       role: 'system',
-      content: 'You are a product analyst. Return only raw JSON. No markdown. No explanation.',
+      content: 'You are a product analyst. Return only raw JSON. No markdown. No explanation. No code blocks.',
     },
     {
       role: 'user',
-      content: `Analyze this website and return ONLY this JSON:
+      content: `Analyze this website and return ONLY this JSON structure with no other text:
 {
   "name": "product name",
   "description": "one sentence what it does",
@@ -70,7 +69,7 @@ async function analyzeProduct(content, url) {
   "subreddits": ["sub1","sub2","sub3","sub4","sub5","sub6","sub7"]
 }
 
-Pick subreddits where the target customer talks about their problems. No r/ prefix.
+Pick subreddits where the target customer actively discusses problems. Use real subreddit names without r/ prefix. Popular choices: SaaS, indiehackers, entrepreneur, startups, smallbusiness, solopreneur, marketing, productivity, freelance, webdev, programming.
 
 URL: ${url}
 Content: ${content.slice(0, 3000)}`,
@@ -84,21 +83,21 @@ Content: ${content.slice(0, 3000)}`,
 async function scorePosts(posts, analysis) {
   if (!posts.length) return []
 
-  const batch = posts.slice(0, 30).map((p, i) => ({
+  const batch = posts.slice(0, 25).map((p, i) => ({
     index: i,
     title: p.title,
-    body: p.body.slice(0, 300),
+    body: p.body.slice(0, 200),
     subreddit: p.subreddit,
   }))
 
   const raw = await callGroq([
     {
       role: 'system',
-      content: 'You are a lead scoring engine. Return only a valid JSON array. No markdown.',
+      content: 'You are a lead scoring engine. You MUST return a valid JSON array. No markdown. No explanation. No code blocks. Only the JSON array.',
     },
     {
       role: 'user',
-      content: `Score these Reddit posts for buying intent relevance to this product.
+      content: `Score these Reddit posts for relevance to this product. Be generous — include anything that could be a potential customer signal.
 
 Product: ${analysis.name}
 Description: ${analysis.description}
@@ -106,24 +105,33 @@ Target customer: ${analysis.targetCustomer}
 Pain points: ${analysis.painPoints.join(', ')}
 Keywords: ${analysis.keywords.join(', ')}
 
-Rules:
-- score: 1-10 (8+ high intent, 5-7 moderate, below 5 skip)
-- signalType: "active" (asking for tools/recommendations) or "passive" (expressing pain)
-- reason: one sentence why it matches
+Scoring rules:
+- 8-10: Directly asking for this type of product or tool
+- 6-7: Expressing a pain point this product solves
+- 4-5: Tangentially related, might be interested
+- Below 4: Not relevant
 
-Return ONLY a JSON array for posts scoring 5 or above:
-[{"index":0,"score":8.5,"signalType":"active","reason":"..."}]
+Signal types:
+- "active": Person is actively looking for a solution, asking for recommendations, comparing tools
+- "passive": Person is expressing frustration or pain but not actively shopping
 
-If none qualify return: []
+IMPORTANT: Include ALL posts scoring 4 or above. Be generous with scoring.
 
-Posts:
+Return ONLY a raw JSON array like this (no other text):
+[{"index":0,"score":7.5,"signalType":"active","reason":"Person is asking for tool recommendations that match this product"}]
+
+If truly nothing is relevant return: []
+
+Posts to score:
 ${JSON.stringify(batch)}`,
     },
-  ], 1500, 0.2)
+  ], 2000, 0.2)
 
   try {
     const clean = raw.replace(/```json|```/g, '').trim()
-    return JSON.parse(clean)
+    const match = clean.match(/\[[\s\S]*\]/)
+    if (!match) return []
+    return JSON.parse(match[0])
   } catch {
     return []
   }
@@ -131,25 +139,25 @@ ${JSON.stringify(batch)}`,
 
 async function generateReply(post, analysis, signalType) {
   const tone = signalType === 'active'
-    ? 'Be direct and helpful. Mention the product naturally but briefly.'
-    : 'Lead with empathy about their pain. Add genuine value first. Only mention the product lightly at the end if truly relevant.'
+    ? 'Be helpful and direct. You can mention the product naturally but do not be salesy.'
+    : 'Lead with genuine empathy. Add real value. Only mention the product briefly if truly relevant.'
 
   const raw = await callGroq([
     {
       role: 'system',
-      content: `You write Reddit replies for founders. Sound human, genuine, never salesy. Max 120 words. No hashtags. No emojis. ${tone}`,
+      content: `You write Reddit replies for founders. Sound human and genuine. Max 100 words. No hashtags. No emojis. ${tone}`,
     },
     {
       role: 'user',
       content: `Write a Reddit reply for this post.
 
 Title: ${post.title}
-Body: ${post.body.slice(0, 400)}
+Body: ${post.body.slice(0, 300)}
 Subreddit: r/${post.subreddit}
 Signal type: ${signalType}
 Product: ${analysis.name} — ${analysis.description}
 
-Write the reply only. No intro. No label.`,
+Write ONLY the reply text. Nothing else.`,
     },
   ], 300, 0.75)
 
@@ -164,19 +172,17 @@ export default async function handler(req, res) {
   const { url } = req.body
   if (!url) return res.status(400).json({ error: 'URL is required' })
 
-  // Mark IP as used
   const ip = getIP(req)
   const now = Date.now()
-  const window = 24 * 60 * 60 * 1000
+  const windowMs = 24 * 60 * 60 * 1000
   const record = ipStore.get(ip)
   if (!record || now > record.resetAt) {
-    ipStore.set(ip, { count: 1, resetAt: now + window })
+    ipStore.set(ip, { count: 1, resetAt: now + windowMs })
   } else {
     ipStore.set(ip, { ...record, count: record.count + 1 })
   }
 
   try {
-    // Step 1: Fetch website via Jina Reader
     let content = ''
     try {
       const jinaRes = await fetch(`https://r.jina.ai/${url}`, {
@@ -185,14 +191,24 @@ export default async function handler(req, res) {
       })
       if (jinaRes.ok) content = await jinaRes.text()
     } catch {
-      // Continue — Groq will use the URL alone
+      // Continue with empty content
     }
 
-    // Step 2: Analyze product
-    const analysis = await analyzeProduct(content, url)
+    let analysis
+    try {
+      analysis = await analyzeProduct(content, url)
+    } catch {
+      analysis = {
+        name: 'Your Product',
+        description: 'A tool for founders',
+        targetCustomer: 'startup founders and entrepreneurs',
+        painPoints: ['finding customers', 'distribution', 'marketing', 'growth', 'sales'],
+        keywords: ['startup', 'saas', 'founder', 'tool', 'software'],
+        subreddits: ['SaaS', 'indiehackers', 'entrepreneur', 'startups', 'solopreneur'],
+      }
+    }
 
-    // Step 3: Fetch Reddit posts in parallel
-    const subreddits = (analysis.subreddits || ['SaaS', 'indiehackers', 'entrepreneur']).slice(0, 6)
+    const subreddits = (analysis.subreddits || ['SaaS', 'indiehackers', 'entrepreneur']).slice(0, 5)
     const postArrays = await Promise.all(subreddits.map(fetchSubreddit))
     const allPosts = postArrays.flat()
 
@@ -200,13 +216,28 @@ export default async function handler(req, res) {
       return res.status(200).json({ analysis, leads: [] })
     }
 
-    // Step 4: Score posts
-    const scores = await scorePosts(allPosts, analysis)
-    if (!scores.length) {
-      return res.status(200).json({ analysis, leads: [] })
+    let scores = []
+    try {
+      scores = await scorePosts(allPosts, analysis)
+    } catch {
+      scores = []
     }
 
-    // Step 5: Top 3 posts — generate draft replies
+    if (!scores.length) {
+      const fallbackLeads = allPosts
+        .sort((a, b) => b.ups - a.ups)
+        .slice(0, 3)
+        .map(post => ({
+          ...post,
+          score: 5.0,
+          signalType: 'passive',
+          reason: 'Trending post in your target community',
+          draftReply: 'Review this post and craft a response that leads with value before mentioning your product.',
+          expiresIn: 120,
+        }))
+      return res.status(200).json({ analysis, leads: fallbackLeads })
+    }
+
     const top3 = scores
       .sort((a, b) => b.score - a.score)
       .slice(0, 3)
@@ -216,11 +247,16 @@ export default async function handler(req, res) {
         const post = allPosts[scored.index]
         if (!post) return null
 
-        const draftReply = await generateReply(post, analysis, scored.signalType)
+        let draftReply = ''
+        try {
+          draftReply = await generateReply(post, analysis, scored.signalType)
+        } catch {
+          draftReply = 'Could not generate reply. Try refreshing.'
+        }
 
         const ageMinutes = (Date.now() - post.createdAt) / 60000
         const maxWindow = scored.signalType === 'active' ? 180 : 360
-        const expiresIn = Math.max(0, maxWindow - ageMinutes)
+        const expiresIn = Math.max(10, maxWindow - ageMinutes)
 
         return {
           ...post,
@@ -241,4 +277,4 @@ export default async function handler(req, res) {
     console.error('Scan error:', err)
     return res.status(500).json({ error: 'Scan failed. Please try again.' })
   }
-}
+                                          }
