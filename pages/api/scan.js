@@ -47,29 +47,34 @@ async function fetchSubreddit(subreddit) {
 
     while ((match = entryRegex.exec(text)) !== null) {
       const entry = match[1]
-
       const title = entry.match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1]?.replace(/<!\[CDATA\[(.*?)\]\]>/, '$1') || ''
       const link = entry.match(/<link[^>]*href="([^"]*)"[^>]*\/>/)?.[1] || entry.match(/<id>([\s\S]*?)<\/id>/)?.[1] || ''
       const content = entry.match(/<content[^>]*>([\s\S]*?)<\/content>/)?.[1] || ''
       const published = entry.match(/<published>([\s\S]*?)<\/published>/)?.[1] || ''
+
       const cleanContent = content
-  .replace(/<[^>]*>/g, '')
-  .replace(/&amp;/g, '&')
-  .replace(/&lt;/g, '<')
-  .replace(/&gt;/g, '>')
-  .replace(/&#39;/g, "'")
-  .replace(/&quot;/g, '"')
-  .replace(/!--.*?--/g, '')
-  .replace(/SC_OFF|SC_ON/g, '')
-  .trim()
-  .slice(0, 500)
+        .replace(/<table[\s\S]*?<\/table>/gi, '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&#39;/g, "'")
+        .replace(/&quot;/g, '"')
+        .replace(/&#32;/g, ' ')
+        .replace(/&[^;]+;/g, ' ')
+        .replace(/!--.*?--/g, '')
+        .replace(/SC_OFF|SC_ON/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 400)
+
       const createdAt = published ? new Date(published).getTime() : Date.now()
 
       if (title && link) {
         posts.push({
           id: link.split('/').filter(Boolean).pop() || Math.random().toString(36).slice(2),
           title: title.trim(),
-          body: cleanContent.trim(),
+          body: cleanContent,
           url: link.trim(),
           subreddit,
           createdAt,
