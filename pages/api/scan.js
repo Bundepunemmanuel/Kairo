@@ -33,7 +33,7 @@ async function fetchSubreddit(subreddit) {
       {
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; Kairo/1.0)',
-          'Accept': 'application/rss+xml, application/xml, text/xml',
+          'Accept': 'application/atom+xml, application/xml, text/xml',
         },
         signal: AbortSignal.timeout(8000),
       }
@@ -42,23 +42,24 @@ async function fetchSubreddit(subreddit) {
     const text = await res.text()
 
     const posts = []
-    const itemRegex = /<item>([\s\S]*?)<\/item>/g
+    const entryRegex = /<entry>([\s\S]*?)<\/entry>/g
     let match
 
-    while ((match = itemRegex.exec(text)) !== null) {
-      const item = match[1]
-      const title = (item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/) || item.match(/<title>(.*?)<\/title>/))?.[1] || ''
-      const link = item.match(/<link>(.*?)<\/link>/)?.[1] || ''
-      const description = (item.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>/) || item.match(/<description>(.*?)<\/description>/))?.[1] || ''
-      const pubDate = item.match(/<pubDate>(.*?)<\/pubDate>/)?.[1] || ''
-      const cleanDesc = description.replace(/<[^>]*>/g, '').slice(0, 500)
-      const createdAt = pubDate ? new Date(pubDate).getTime() : Date.now()
+    while ((match = entryRegex.exec(text)) !== null) {
+      const entry = match[1]
+
+      const title = entry.match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1]?.replace(/<!\[CDATA\[(.*?)\]\]>/, '$1') || ''
+      const link = entry.match(/<link[^>]*href="([^"]*)"[^>]*\/>/)?.[1] || entry.match(/<id>([\s\S]*?)<\/id>/)?.[1] || ''
+      const content = entry.match(/<content[^>]*>([\s\S]*?)<\/content>/)?.[1] || ''
+      const published = entry.match(/<published>([\s\S]*?)<\/published>/)?.[1] || ''
+      const cleanContent = content.replace(/<[^>]*>/g, '').replace(/&[^;]+;/g, ' ').slice(0, 500)
+      const createdAt = published ? new Date(published).getTime() : Date.now()
 
       if (title && link) {
         posts.push({
           id: link.split('/').filter(Boolean).pop() || Math.random().toString(36).slice(2),
           title: title.trim(),
-          body: cleanDesc.trim(),
+          body: cleanContent.trim(),
           url: link.trim(),
           subreddit,
           createdAt,
