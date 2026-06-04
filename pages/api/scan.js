@@ -52,7 +52,17 @@ async function fetchSubreddit(subreddit) {
       const link = entry.match(/<link[^>]*href="([^"]*)"[^>]*\/>/)?.[1] || entry.match(/<id>([\s\S]*?)<\/id>/)?.[1] || ''
       const content = entry.match(/<content[^>]*>([\s\S]*?)<\/content>/)?.[1] || ''
       const published = entry.match(/<published>([\s\S]*?)<\/published>/)?.[1] || ''
-      const cleanContent = content.replace(/<[^>]*>/g, '').replace(/&[^;]+;/g, ' ').slice(0, 500)
+      const cleanContent = content
+  .replace(/<[^>]*>/g, '')
+  .replace(/&amp;/g, '&')
+  .replace(/&lt;/g, '<')
+  .replace(/&gt;/g, '>')
+  .replace(/&#39;/g, "'")
+  .replace(/&quot;/g, '"')
+  .replace(/!--.*?--/g, '')
+  .replace(/SC_OFF|SC_ON/g, '')
+  .trim()
+  .slice(0, 500)
       const createdAt = published ? new Date(published).getTime() : Date.now()
 
       if (title && link) {
