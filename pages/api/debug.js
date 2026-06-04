@@ -1,43 +1,22 @@
 export default async function handler(req, res) {
   const results = {}
 
-  // Test 1: Groq API key exists
-  results.hasGroqKey = !!process.env.GROQ_API_KEY
-  results.groqKeyLength = process.env.GROQ_API_KEY?.length || 0
-
-  // Test 2: Reddit fetch
+  // Test RSS feed
   try {
-    const r = await fetch('https://www.reddit.com/r/SaaS/new.json?limit=3', {
-      headers: { 'User-Agent': 'Kairo/1.0' },
+    const r = await fetch('https://www.reddit.com/r/SaaS/new.rss', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; Kairo/1.0)',
+        'Accept': 'application/rss+xml',
+      },
       signal: AbortSignal.timeout(8000),
     })
-    const d = await r.json()
-    results.redditStatus = r.status
-    results.redditPostCount = d?.data?.children?.length || 0
-    results.firstPostTitle = d?.data?.children?.[0]?.data?.title || 'none'
+    const text = await r.text()
+    results.rssStatus = r.status
+    results.rssFirst200Chars = text.slice(0, 200)
+    results.containsItems = text.includes('<item>')
+    results.itemCount = (text.match(/<item>/g) || []).length
   } catch (e) {
-    results.redditError = e.message
-  }
-
-  // Test 3: Groq API
-  try {
-    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [{ role: 'user', content: 'Reply with just the word: working' }],
-        max_tokens: 10,
-      }),
-    })
-    const d = await r.json()
-    results.groqStatus = r.status
-    results.groqResponse = d.choices?.[0]?.message?.content || d.error?.message || 'no response'
-  } catch (e) {
-    results.groqError = e.message
+    results.rssError = e.message
   }
 
   return res.status(200).json(results)
