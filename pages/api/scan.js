@@ -107,11 +107,11 @@ Pain points: ${analysis.painPoints.join(', ')}
 Keywords: ${analysis.keywords.join(', ')}
 
 Rules:
-- score: 1-10 (8+ high intent, 6-7 moderate, below 6 skip)
+- score: 1-10 (8+ high intent, 5-7 moderate, below 5 skip)
 - signalType: "active" (asking for tools/recommendations) or "passive" (expressing pain)
 - reason: one sentence why it matches
 
-Return ONLY a JSON array for posts scoring 6 or above:
+Return ONLY a JSON array for posts scoring 5 or above:
 [{"index":0,"score":8.5,"signalType":"active","reason":"..."}]
 
 If none qualify return: []
