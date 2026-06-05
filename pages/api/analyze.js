@@ -47,7 +47,9 @@ export default async function handler(req, res) {
 Pick subreddits where the target customer discusses problems. No r/ prefix. Good choices: SaaS, indiehackers, entrepreneur, startups, smallbusiness, solopreneur, marketing, productivity, freelance, webdev.
 
 URL: ${url}
-Content: ${content.slice(0, 3000)}`,
+Content: ${content.slice(0, 3000)}
+
+IMPORTANT: If the content above is thin or empty, analyze the URL and domain name itself to infer what the product does and who uses it. Always return subreddits where the actual target customer spends time, not generic startup subreddits.`,
           },
         ],
         max_tokens: 800,

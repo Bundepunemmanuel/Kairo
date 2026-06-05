@@ -78,7 +78,7 @@ async function generateReply(post, analysis, signalType) {
   const raw = await callGroq([
     {
       role: 'system',
-      content: `You write Reddit replies for founders. Sound human. strictly under 75 words. short paragraph . No hashtags. No emojis. ${tone}`,
+      content: `You write Reddit replies for founders. Sound human. Max 100 words. No hashtags. No emojis. ${tone}`,
     },
     {
       role: 'user',
@@ -117,7 +117,7 @@ export default async function handler(req, res) {
         ...post,
         score: 5.0,
         signalType: 'passive',
-        reason: 'Active discussion in your target community',
+        reason: `Discussion in r/${post.subreddit} relevant to your target customer`,
         draftReply: 'Lead with genuine value and empathy before mentioning your product.',
         expiresIn: 120,
       }))

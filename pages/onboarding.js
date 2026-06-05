@@ -160,7 +160,13 @@ export default function Onboarding() {
       // Step 2: Fetch Reddit posts from browser directly
       const subreddits = (productAnalysis.subreddits || ['SaaS', 'indiehackers', 'entrepreneur']).slice(0, 5)
       const postArrays = await Promise.all(subreddits.map(fetchSubredditFromBrowser))
-      const allPosts = postArrays.flat()
+      const allPosts = postArrays.flat().filter(p =>
+        p.body &&
+        p.body.length > 40 &&
+        !p.body.includes('submitted by') &&
+        !p.body.includes('[link]') &&
+        !p.body.includes('[comments]')
+      )
 
       if (!allPosts.length) {
         setLeads([])
