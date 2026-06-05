@@ -292,30 +292,24 @@ export default function Onboarding() {
               {/* Email Gate */}
               {!emailDone ? (
                 <div className="email-gate">
-                  <div className="email-gate-inner">
-                    <div className="email-gate-icon">📬</div>
-                    <h3 className="email-gate-headline">Want leads like these every day?</h3>
-                    <p className="email-gate-sub">
-                      Kairo scans Reddit every 15 minutes and sends critical leads straight to you — while you focus on building.
-                    </p>
-                    <div className="email-gate-row">
-                      <input
-                        type="email"
-                        placeholder="your@email.com"
-                        value={email}
-                        onChange={e => setEmail(e.target.value)}
-                        className="email-input"
-                        onKeyDown={e => e.key === 'Enter' && handleEmail()}
-                      />
-                      <button className="email-submit" onClick={handleEmail}>Get Daily Leads →</button>
-                    </div>
-                    <p className="email-gate-note">No spam. No credit card. Unsubscribe anytime.</p>
-                  </div>
-                </div>
-              ) : (
-                <div className="email-success">
-                  <span className="email-success-icon">🎉</span>
-                  <div>
+  <div className="email-gate-inner">
+    <div className="email-gate-icon">🚀</div>
+    <h3 className="email-gate-headline">Want leads like these every day?</h3>
+    <p className="email-gate-sub">
+      Kairo scans Reddit every 15 minutes and finds critical leads automatically — while you focus on building.
+    </p>
+    <a
+      href="https://docs.google.com/forms/d/e/1FAIpQLSfRHyC7A3nteravGbpNqWtk7kroOkY2hrMGVM9_6T-cO7RumA/viewform?usp=dialog"
+      target="_blank"
+      rel="noopener noreferrer"
+      className="ob-scan-btn"
+      style={{ textAlign: 'center', textDecoration: 'none', display: 'block' }}
+    >
+      Join Kairo →
+    </a>
+    <p className="email-gate-note">Free to join · No credit card · Launching August 13th</p>
+  </div>
+</div>
                     <p className="email-success-title">You're in. Kairo is watching Reddit for you.</p>
                     <p className="email-success-note">
                       <Link href="/#pricing" className="upgrade-link">Upgrade to Pro</Link> to unlock all leads and draft replies.
