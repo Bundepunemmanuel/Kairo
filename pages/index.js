@@ -73,9 +73,9 @@ export default function Home() {
 
       {/* Announcement */}
       <div className="announcement">
-        <span>🔴 Kairo is live — August 13th</span>
+        <span>🔴 Try the live demo free</span>
         <span style={{ opacity: 0.4 }}>·</span>
-        <span>No waitlist. Try it free today.</span>
+        <span>Join the waitlist for full access.</span>
       </div>
 
       {/* Nav */}
