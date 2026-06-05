@@ -102,10 +102,10 @@ export default function Onboarding() {
   }
 
   const handleEmail = () => {
-    if (!email || !email.includes('@')) return
-    localStorage.setItem('kairo_email', email)
-    setEmailDone(true)
-    // Will connect to Supabase in Chunk 2
+  if (!email || !email.includes('@')) return
+  localStorage.setItem('kairo_email', email)
+  setEmailDone(true)
+  window.open('https://docs.google.com/forms/d/e/1FAIpQLSfRHyC7A3nteravGbpNqWtk7kroOkY2hrMGVM9_6T-cO7RumA/viewform?usp=dialog', '_blank')
   }
 
   const handleCopy = (id, text) => {
@@ -335,7 +335,7 @@ export default function Onboarding() {
               <h2 className="gate-headline">You've used your free scan</h2>
               <p className="gate-sub">Sign up free to scan again and get 3 leads daily. Upgrade anytime for more.</p>
               <div className="gate-actions">
-                <Link href="/#pricing" className="btn-primary">See Plans →</Link>
+                <a href="https://docs.google.com/forms/d/e/1FAIpQLSfRHyC7A3nteravGbpNqWtk7kroOkY2hrMGVM9_6T-cO7RumA/viewform?usp=dialog" target="_blank" rel="noopener noreferrer" className="btn-primary">Join Kairo →</a>
                 <button className="gate-back" onClick={() => { setStage('input'); setUrl('') }}>← Back</button>
               </div>
             </div>
