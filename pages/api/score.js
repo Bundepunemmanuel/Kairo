@@ -78,7 +78,7 @@ async function generateReply(post, analysis, signalType) {
   const raw = await callGroq([
     {
       role: 'system',
-      content: `You write Reddit replies for founders. Sound human. Max 100 words. No hashtags. No emojis. ${tone}`,
+      content: `You write Reddit replies for founders. Sound human. strictly under 75 words. short paragraph . No hashtags. No emojis. ${tone}`,
     },
     {
       role: 'user',
