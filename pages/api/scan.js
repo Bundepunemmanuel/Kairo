@@ -28,7 +28,13 @@ async function callGroq(messages, maxTokens = 1000, temperature = 0.3) {
 
 async function fetchSubreddit(subreddit) {
   try {
-    const res = await fetch(`/api/reddit?sub=${encodeURIComponent(subreddit)}&sort=new`)
+    const base = process.env.VERCEL_URL
+      ? `https://${process.env.VERCEL_URL}`
+      : 'http://localhost:3000'
+
+    const res = await fetch(
+      `${base}/api/reddit?sub=${encodeURIComponent(subreddit)}&sort=new`
+    )
     if (!res.ok) return []
     const xml = await res.text()
     if (!xml.includes('<entry>')) return []
@@ -44,8 +50,12 @@ async function fetchSubreddit(subreddit) {
       const content = (entry.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1]
         ?.replace(/<!\[CDATA\[|\]\]>/g, '')
         ?.replace(/<[^>]+>/g, ' ')
-        ?.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-        ?.replace(/\s+/g, ' ').trim().slice(0, 300) ?? ''
+        ?.replace(/&amp;/g, '&')
+        ?.replace(/&lt;/g, '<')
+        ?.replace(/&gt;/g, '>')
+        ?.replace(/\s+/g, ' ')
+        ?.trim()
+        ?.slice(0, 300) ?? ''
       const published = (entry.match(/<published>([\s\S]*?)<\/published>/) || [])[1] || ''
 
       if (!title || !link.includes('/comments/')) continue
