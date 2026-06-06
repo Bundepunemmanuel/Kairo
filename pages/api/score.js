@@ -45,10 +45,12 @@ Pain points: ${analysis.painPoints.join(', ')}
 Keywords: ${analysis.keywords.join(', ')}
 
 Rules:
-- 8-10: Directly asking for this type of product
-- 6-7: Expressing a pain point this product solves
-- 4-5: Tangentially related
-- Below 4: Skip
+- 8-10: Directly asking for this type of product or tool AND appears to be an experienced user or professional, not a beginner
+- 6-7: Expressing a pain point this product solves, has context suggesting they understand the space
+- 4-5: Tangentially related but may be too early stage or beginner level
+- Below 4: Skip — beginner questions, people learning basics, or clearly wrong audience
+
+Important: A beginner asking foundational questions is NOT a high intent lead even if the topic matches. Score based on buyer sophistication not just topic relevance.
 
 signalType: "active" (asking for tools/recs) or "passive" (expressing pain)
 
