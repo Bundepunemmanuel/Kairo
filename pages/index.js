@@ -10,7 +10,7 @@ const STATS = [
 ]
 
 const STEPS = [
-  { n: '01', title: 'Paste your URL', desc: 'Drop your landing page URL. Kairo reads your product, understands your customer, and maps the subreddits where they hang out.' },
+  { n: '01', title: 'Paste your site URL', desc: 'Drop your landing page URL. Kairo reads your product, understands your customer, and maps the subreddits where they hang out.' },
   { n: '02', title: 'Kairo hunts', desc: 'Our engine scans Reddit every 15 minutes. Every post is scored for buying intent, pain signals, and competitor frustration.' },
   { n: '03', title: 'You see real leads', desc: 'Active or passive demand — each lead is labeled, scored, and comes with a decay timer so you know exactly how long you have.' },
   { n: '04', title: 'Reply with confidence', desc: 'Kairo drafts the reply for you. Value-first, human-sounding, calibrated to the signal type. One click opens the Reddit thread.' },
