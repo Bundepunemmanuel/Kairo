@@ -1,7 +1,7 @@
 # Kairo — Customer Acquisition Platform for Solo Founders
 
 Kairo automatically finds people on Reddit who are ready to buy products like yours.
-Paste your URL → Kairo reads your product → finds live Reddit posts with buying intent → scores them → drafts your reply → shows a decay timer.
+Paste your URL → Kairo reads your product → finds live Reddit posts with buying intent → scores them → drafts your reply → shows a decay timer and
 
 ---
 
