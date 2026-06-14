@@ -1,6 +1,6 @@
 // Best file ♥️♥️♥️
 
-analyze.js — Product analysis: extracts precise ICP and specific problems for any product
+//analyze.js — Product analysis: extracts precise ICP and specific problems for any product
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
