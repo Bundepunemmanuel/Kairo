@@ -6,14 +6,16 @@ const GOOGLE_FORM = 'https://docs.google.com/forms/d/e/1FAIpQLSfRHyC7A3nteravGbp
 
 const LOADING_STATES = [
   'Reading your product...',
-  'Identifying your ideal customer...',
-  'Finding where they spend time...',
+  'Mapping the problems you solve...',
+  'Finding where your customers post...',
   'Scanning Reddit for live signals...',
-  'Scoring buying intent...',
-  'Drafting your replies...',
+  'Checking comments for buying intent...',
+  'Qualifying leads against your ICP...',
+  'Drafting replies...',
 ]
 
-// Parse Reddit Atom feed - same approach as SubScan
+// ─── Reddit parsing ────────────────────────────────────────────────────────
+
 function parseAtom(xml, subreddit) {
   const posts = []
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)]
@@ -25,24 +27,22 @@ function parseAtom(xml, subreddit) {
     const rawContent = (entry.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1] || ''
     const content = rawContent
       .replace(/<!\[CDATA\[|\]\]>/g, '')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&#32;/g, ' ')
-      .replace(/&[^;]{1,6};/g, ' ')
-      .replace(/<!--.*?-->/gs, '')
-      .replace(/SC_OFF|SC_ON/g, '')
-      .replace(/<table[\s\S]*?<\/table>/gi, '')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 300)
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#32;/g, ' ')
+      .replace(/&[^;]{1,6};/g, ' ').replace(/<!--.*?-->/gs, '')
+      .replace(/SC_OFF|SC_ON/g, '').replace(/<table[\s\S]*?<\/table>/gi, '')
+      .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+      .slice(0, 600) // Increased from 300 — more context for better scoring
     const published = (entry.match(/<published>([\s\S]*?)<\/published>/) || [])[1] || ''
     if (!title || !link.includes('/comments/')) continue
+
+    // Extract post ID from URL for comment fetching
+    const urlParts = link.split('/')
+    const commentsIdx = urlParts.indexOf('comments')
+    const postId = commentsIdx !== -1 ? urlParts[commentsIdx + 1] : urlParts.filter(Boolean).pop()
+
     posts.push({
-      id: link.split('/').filter(Boolean).pop() || Math.random().toString(36).slice(2),
+      id: postId || Math.random().toString(36).slice(2),
       title: title.trim(),
       body: content,
       url: link.trim(),
@@ -54,7 +54,6 @@ function parseAtom(xml, subreddit) {
   return posts
 }
 
-// Fetch Reddit from browser - avoids server-side blocking
 async function fetchSubredditFromBrowser(subreddit) {
   try {
     const res = await fetch(
@@ -70,31 +69,47 @@ async function fetchSubredditFromBrowser(subreddit) {
   }
 }
 
-// Call Groq API from browser - same as SubScan
-async function callGroqFromBrowser(messages, maxTokens = 1000, temperature = 0.3) {
-  const res = await fetch('/api/groq', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages, maxTokens, temperature }),
-  })
-  const data = await res.json()
-  return data.content || ''
+// Fetch comments for a specific post
+async function fetchCommentsFromBrowser(subreddit, postId) {
+  try {
+    const res = await fetch(
+      `/api/reddit?mode=comments&sub=${encodeURIComponent(subreddit)}&postId=${encodeURIComponent(postId)}`,
+      { signal: AbortSignal.timeout(8000) }
+    )
+    if (!res.ok) return []
+    const data = await res.json()
+    return data.comments || []
+  } catch {
+    return []
+  }
 }
+
+// ─── Component ────────────────────────────────────────────────────────────
 
 export default function Onboarding() {
   const [url, setUrl] = useState('')
   const [stage, setStage] = useState('input')
   const [loadingIndex, setLoadingIndex] = useState(0)
+  const [loadingMessage, setLoadingMessage] = useState(LOADING_STATES[0])
   const [leads, setLeads] = useState([])
   const [analysis, setAnalysis] = useState(null)
   const [expandedLead, setExpandedLead] = useState(null)
   const [error, setError] = useState('')
   const [timers, setTimers] = useState({})
   const [copiedId, setCopiedId] = useState(null)
+  const [scanStats, setScanStats] = useState(null) // { postsScanned, subreddits }
+  const [replies, setReplies] = useState({}) // { [leadId]: reply text }
+  const [replyLoading, setReplyLoading] = useState({}) // { [leadId]: true/false }
 
   useEffect(() => {
     if (stage !== 'loading') return
-    const t = setInterval(() => setLoadingIndex(i => (i + 1) % LOADING_STATES.length), 1800)
+    const t = setInterval(() => {
+      setLoadingIndex(i => {
+        const next = (i + 1) % LOADING_STATES.length
+        setLoadingMessage(LOADING_STATES[next])
+        return next
+      })
+    }, 2200)
     return () => clearInterval(t)
   }, [stage])
 
@@ -112,7 +127,7 @@ export default function Onboarding() {
         })
         return next
       })
-    }, 15000)
+    }, 30000)
     return () => clearInterval(t)
   }, [leads])
 
@@ -123,8 +138,8 @@ export default function Onboarding() {
     return h > 0 ? `${h}h ${m}m` : `${m}m remaining`
   }
 
-  const timerColor = mins => mins <= 30 ? '#c0584a' : mins <= 120 ? '#d4903a' : '#5a8a5a'
-  const urgencyLabel = mins => mins <= 30 ? '🔴 Critical' : mins <= 120 ? '🟡 Active' : '🟢 Fresh'
+  const timerColor = mins => mins <= 0 ? '#999999' : mins <= 30 ? '#c0584a' : mins <= 120 ? '#d4903a' : '#5a8a5a'
+  const urgencyLabel = mins => mins <= 0 ? '⚫ Expired' : mins <= 30 ? '🔴 Critical' : mins <= 120 ? '🟡 Active' : '🟢 Fresh'
 
   const isValidUrl = str => {
     try { new URL(str.startsWith('http') ? str : `https://${str}`); return true }
@@ -139,26 +154,43 @@ export default function Onboarding() {
     if (localStorage.getItem('kairo_scan_used')) { setStage('gate'); return }
 
     try {
-      const r = await fetch('/api/check-ip')
+      const r = await fetch('/api/check-ip', { signal: AbortSignal.timeout(5000) })
       const d = await r.json()
       if (d.blocked) { setStage('gate'); return }
-    } catch { /* allow */ }
+    } catch { /* allow on timeout */ }
 
     setError('')
     setStage('loading')
+    setLoadingIndex(0)
+    setLoadingMessage(LOADING_STATES[0])
 
     try {
-      // Step 1: Analyze product via server API
+      // ── Step 1: Analyze product — extract specific problems, not just audience
       const analyzeRes = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: clean }),
       })
-      const { analysis: productAnalysis } = await analyzeRes.json()
+
+      if (!analyzeRes.ok) {
+        throw new Error('Could not analyze your product. Please check the URL and try again.')
+      }
+
+      let analyzeData
+      try {
+        analyzeData = await analyzeRes.json()
+      } catch {
+        throw new Error('Could not analyze your product. Please check the URL and try again.')
+      }
+      if (!analyzeData.analysis) {
+        throw new Error('Analysis failed. Please try again.')
+      }
+
+      const productAnalysis = analyzeData.analysis
       setAnalysis(productAnalysis)
 
-      // Step 2: Fetch Reddit posts from browser directly
-      const subreddits = (productAnalysis.subreddits || ['SaaS', 'indiehackers', 'entrepreneur']).slice(0, 5)
+      // ── Step 2: Fetch Reddit posts from browser (avoids server-side blocking)
+      const subreddits = (productAnalysis.subreddits || ['SaaS', 'indiehackers', 'entrepreneur']).slice(0, 6)
       const postArrays = await Promise.all(subreddits.map(fetchSubredditFromBrowser))
       const allPosts = postArrays.flat().filter(p =>
         p.body &&
@@ -168,20 +200,36 @@ export default function Onboarding() {
         !p.body.includes('[comments]')
       )
 
+      setScanStats({ postsScanned: allPosts.length, subreddits })
+
       if (!allPosts.length) {
-        setLeads([])
         localStorage.setItem('kairo_scan_used', '1')
+        setLeads([])
         setStage('results')
         return
       }
 
-      // Step 3: Score and generate replies via server API
+      // ── Step 3: Fetch comments for each post (in parallel, best-effort)
+      // We fetch comments for ALL posts so score.js can find comment-level signals
+      const commentsMap = {}
+      const commentFetches = allPosts.map(async post => {
+        const comments = await fetchCommentsFromBrowser(post.subreddit, post.id)
+        if (comments.length > 0) {
+          commentsMap[post.id] = comments
+        }
+      })
+      await Promise.allSettled(commentFetches) // Never block on comment failures
+
+      // ── Step 4: Score posts + comments, generate replies
       const scoreRes = await fetch('/api/score', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ posts: allPosts, analysis: productAnalysis }),
+        body: JSON.stringify({ posts: allPosts, analysis: productAnalysis, commentsMap }),
       })
-      const { leads: scoredLeads } = await scoreRes.json()
+
+      const { leads: scoredLeads, error: scoreError } = await scoreRes.json()
+
+      if (scoreError) throw new Error(scoreError)
 
       localStorage.setItem('kairo_scan_used', '1')
       setLeads(scoredLeads || [])
@@ -189,6 +237,37 @@ export default function Onboarding() {
     } catch (e) {
       setError(e.message || 'Something went wrong. Please try again.')
       setStage('input')
+    }
+  }
+
+  const handleViewReply = async (leadId, lead) => {
+    // If already open, close it
+    if (expandedLead === leadId) {
+      setExpandedLead(null)
+      return
+    }
+    setExpandedLead(leadId)
+    // If reply already fetched, don't fetch again
+    if (replies[leadId] !== undefined) return
+    // Fetch reply on demand
+    setReplyLoading(prev => ({ ...prev, [leadId]: true }))
+    try {
+      const res = await fetch('/api/reply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          post: { title: lead.title, body: lead.body, subreddit: lead.subreddit },
+          analysis,
+          signalType: lead.signalType,
+          specificProblem: lead.specificProblem,
+        }),
+      })
+      const data = await res.json()
+      setReplies(prev => ({ ...prev, [leadId]: data.reply || '' }))
+    } catch {
+      setReplies(prev => ({ ...prev, [leadId]: '' }))
+    } finally {
+      setReplyLoading(prev => ({ ...prev, [leadId]: false }))
     }
   }
 
@@ -217,7 +296,7 @@ export default function Onboarding() {
           <a href={GOOGLE_FORM} target="_blank" rel="noopener noreferrer" style={{ fontSize: '0.88rem', fontWeight: 500, color: 'var(--rust)' }}>Join Kairo</a>
         </nav>
 
-        {/* INPUT */}
+        {/* ── INPUT ── */}
         {stage === 'input' && (
           <div className="ob-stage">
             <div className="ob-input-content">
@@ -229,7 +308,7 @@ export default function Onboarding() {
                 Paste your URL.<br /><em>Find your first customer.</em>
               </h1>
               <p className="ob-sub">
-                Kairo reads your product, finds where your customers are on Reddit, and surfaces people ready to buy — right now.
+                Kairo reads your product, maps the specific problems you solve, and surfaces Reddit users experiencing those exact problems right now.
               </p>
 
               <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -259,15 +338,15 @@ export default function Onboarding() {
               </div>
 
               <div className="ob-proof">
-                <span className="ob-proof-item">✓ Results in under 2 minutes</span>
-                <span className="ob-proof-item">✓ Real Reddit posts</span>
+                <span className="ob-proof-item">✓ Problem-matched leads only</span>
+                <span className="ob-proof-item">✓ Posts and comments scanned</span>
                 <span className="ob-proof-item">✓ Draft reply included</span>
               </div>
             </div>
           </div>
         )}
 
-        {/* LOADING */}
+        {/* ── LOADING ── */}
         {stage === 'loading' && (
           <div className="ob-stage">
             <div className="ob-loading-content">
@@ -276,18 +355,18 @@ export default function Onboarding() {
                 <div className="loading-orb-ring" />
                 <div className="loading-orb-ring2" />
               </div>
-              <p className="loading-text">{LOADING_STATES[loadingIndex]}</p>
+              <p className="loading-text">{loadingMessage}</p>
               <div className="loading-dots">
                 {LOADING_STATES.map((_, i) => (
                   <div key={i} className={`loading-dot${i <= loadingIndex ? ' active' : ''}`} />
                 ))}
               </div>
-              <p className="loading-note">Scanning recent posts across your subreddits</p>
+              <p className="loading-note">Matching problems, not just audience</p>
             </div>
           </div>
         )}
 
-        {/* RESULTS */}
+        {/* ── RESULTS ── */}
         {stage === 'results' && analysis && (
           <div className="ob-results">
             <div className="product-bar">
@@ -298,7 +377,7 @@ export default function Onboarding() {
                   <span className="product-desc">{analysis.description}</span>
                 </div>
                 <div className="sub-chips">
-                  {(analysis.subreddits || []).slice(0, 4).map(s => (
+                  {(analysis.subreddits || []).slice(0, 5).map(s => (
                     <span key={s} className="sub-chip">r/{s}</span>
                   ))}
                 </div>
@@ -308,19 +387,48 @@ export default function Onboarding() {
             <div className="leads-wrap">
               <div className="leads-header">
                 <div>
-                  <h2 className="leads-headline">{leads.length} customer {leads.length === 1 ? 'opportunity' : 'opportunities'} found</h2>
-                  <p className="leads-sub">Sorted by urgency. Act on critical leads first.</p>
+                  <h2 className="leads-headline">
+                    {leads.length > 0
+                      ? `${leads.length} qualified ${leads.length === 1 ? 'lead' : 'leads'} found`
+                      : 'No qualifying leads right now'}
+                  </h2>
+                  <p className="leads-sub">
+                    {leads.length > 0
+                      ? 'Every lead matched to a specific problem you solve. Sorted by urgency.'
+                      : scanStats
+                        ? `Scanned ${scanStats.postsScanned} posts across ${scanStats.subreddits.length} subreddits. Nothing matched your specific problems.`
+                        : 'Posts scanned but nothing matched your specific problems.'}
+                  </p>
                 </div>
-                <div className="free-tag">3 free · <a href={GOOGLE_FORM} target="_blank" rel="noopener noreferrer" className="upgrade-link">Get more</a></div>
+                {leads.length > 0 && (
+                  <div className="free-tag">3 free · <a href={GOOGLE_FORM} target="_blank" rel="noopener noreferrer" className="upgrade-link">Get more</a></div>
+                )}
               </div>
 
+              {/* Zero results state — honest and confident */}
               {leads.length === 0 && (
-                <div className="no-leads">No high-intent leads found right now. Try again in 15 minutes as new posts arrive.</div>
+                <div className="no-leads-box">
+                  <div className="no-leads-icon">🔍</div>
+                  <h3 className="no-leads-headline">Nothing qualified this scan</h3>
+                  <p className="no-leads-body">
+                    Kairo only surfaces leads where someone is <strong>specifically experiencing a problem you solve</strong>. Right now, the recent posts in your subreddits don't meet that bar.
+                  </p>
+                  <p className="no-leads-body" style={{ marginTop: 8 }}>
+                    This is a good thing — you're not wasting time on weak matches. Try again in 15–30 minutes as new posts arrive.
+                  </p>
+                  <div className="no-leads-actions">
+                    <a href={GOOGLE_FORM} target="_blank" rel="noopener noreferrer" className="ob-scan-btn" style={{ textDecoration: 'none', display: 'inline-block', textAlign: 'center' }}>
+                      Get notified when leads appear →
+                    </a>
+                  </div>
+                </div>
               )}
 
               {leads.map((lead, i) => {
                 const mins = timers[lead.id] ?? lead.expiresIn
                 const isOpen = expandedLead === lead.id
+                const isCommentLead = !!lead.commentLead
+
                 return (
                   <div key={lead.id} className={`lead-card${i === 0 ? ' lead-card-critical' : ''}`}>
                     <div className="lead-card-top">
@@ -335,6 +443,9 @@ export default function Onboarding() {
                         </span>
                         <span className="lead-subreddit">r/{lead.subreddit}</span>
                         <span className="lead-score">Score: {Number(lead.score).toFixed(1)}</span>
+                        {isCommentLead && (
+                          <span className="comment-lead-badge">💬 Signal in comments</span>
+                        )}
                       </div>
                       <div className="timer-badge" style={{ color: timerColor(mins) }}>
                         <span className="timer-dot" style={{ background: timerColor(mins) }} />
@@ -343,63 +454,90 @@ export default function Onboarding() {
                     </div>
 
                     <h3 className="lead-title">{lead.title}</h3>
-                    {lead.body && <p className="lead-body">{lead.body.length > 220 ? lead.body.slice(0, 220) + '...' : lead.body}</p>}
 
+                    {/* If signal came from a comment, show the comment — not the post body */}
+                    {isCommentLead ? (
+                      <div className="comment-signal-box">
+                        <span className="comment-signal-label">💬 Buying signal found in a comment:</span>
+                        <p className="comment-signal-text">
+                          {lead.commentLead.body.length > 280
+                            ? lead.commentLead.body.slice(0, 280) + '...'
+                            : lead.commentLead.body}
+                        </p>
+                      </div>
+                    ) : (
+                      lead.body && <p className="lead-body">{lead.body.length > 220 ? lead.body.slice(0, 220) + '...' : lead.body}</p>
+                    )}
+
+                    {/* Specific problem match — not generic "relevant to your audience" */}
                     <div className="lead-reason">
-                      <span className="lead-reason-label">Why this matches:</span>
+                      <span className="lead-reason-label">Problem matched:</span>
+                      <span>{lead.specificProblem || lead.reason}</span>
+                    </div>
+
+                    <div className="lead-reason" style={{ marginTop: 4, opacity: 0.75 }}>
+                      <span className="lead-reason-label">Why qualified:</span>
                       <span>{lead.reason}</span>
                     </div>
 
                     {isOpen && (
-                      <div className="draft-box">
-                        <div className="draft-header">
-                          <span className="draft-label">✍️ Draft Reply</span>
-                          <button className="copy-btn" onClick={() => handleCopy(lead.id, lead.draftReply)}>
-                            {copiedId === lead.id ? 'Copied!' : 'Copy'}
-                          </button>
-                        </div>
-                        <p className="draft-text">{lead.draftReply}</p>
+                      <div className="reply-gate-box">
+                        <div className="reply-gate-icon">✍️</div>
+                        <p className="reply-gate-headline">Your reply is ready</p>
+                        <p className="reply-gate-sub">
+                          Kairo drafts a personalized reply for every lead — written to match their exact situation. Join the waitlist to unlock it.
+                        </p>
+                        <a
+                          href={GOOGLE_FORM}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="reply-gate-btn"
+                        >
+                          Join Kairo to get your reply →
+                        </a>
+                        <p className="reply-gate-note">Free · Launching August 13th · No credit card</p>
                       </div>
                     )}
 
                     <div className="lead-actions">
                       <button className="lead-btn-primary" onClick={() => setExpandedLead(isOpen ? null : lead.id)}>
-                        {isOpen ? 'Hide Reply' : 'View Draft Reply'}
+                        {isOpen ? 'Hide Reply' : '✍️ View Draft Reply'}
                       </button>
                       <a href={lead.url} target="_blank" rel="noopener noreferrer" className="lead-btn-secondary">
                         Open in Reddit ↗
                       </a>
-                      <button className="lead-btn-dismiss">Dismiss</button>
                     </div>
                   </div>
                 )
               })}
 
-              {/* Join Kairo CTA */}
-              <div className="email-gate">
-                <div className="email-gate-inner">
-                  <div className="email-gate-icon">🚀</div>
-                  <h3 className="email-gate-headline">Want leads like these every day?</h3>
-                  <p className="email-gate-sub">
-                    Kairo scans Reddit every 15 minutes and finds critical leads automatically — while you focus on building.
-                  </p>
-                  <a
-                    href={GOOGLE_FORM}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="ob-scan-btn"
-                    style={{ textAlign: 'center', textDecoration: 'none', display: 'block', marginTop: 4 }}
-                  >
-                    Join Kairo — Free →
-                  </a>
-                  <p className="email-gate-note">No credit card · Launching August 13th</p>
+              {/* Join CTA — only show if there were leads */}
+              {leads.length > 0 && (
+                <div className="email-gate">
+                  <div className="email-gate-inner">
+                    <div className="email-gate-icon">🚀</div>
+                    <h3 className="email-gate-headline">Want leads like these every day?</h3>
+                    <p className="email-gate-sub">
+                      Kairo scans Reddit every 15 minutes and finds critical leads automatically — while you focus on building.
+                    </p>
+                    <a
+                      href={GOOGLE_FORM}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="ob-scan-btn"
+                      style={{ textAlign: 'center', textDecoration: 'none', display: 'block', marginTop: 4 }}
+                    >
+                      Join Kairo — Free →
+                    </a>
+                    <p className="email-gate-note">No credit card · Launching August 13th</p>
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
           </div>
         )}
 
-        {/* GATE */}
+        {/* ── GATE ── */}
         {stage === 'gate' && (
           <div className="ob-stage">
             <div className="ob-gate-content">
