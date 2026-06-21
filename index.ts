@@ -1,14 +1,16 @@
 // Supabase Edge Function — cron-scan
 // Runs every 30 minutes via pg_cron
-// For each user under their daily quota: fetch fresh Reddit posts using their
-// SAVED analysis (no Jina/Groq analyze call), score them, append new leads.
+// For each user under their daily quota: fetch fresh Reddit posts via the
+// Next.js /api/reddit proxy (fixes Reddit blocking direct Deno fetches),
+// score using their SAVED analysis (no Jina/Groq analyze call), append new
+// leads, and send Telegram notifications if configured.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-const GROQ_API_KEY = Deno.env.get('GROQ_API_KEY')!
 const NEXTJS_BASE_URL = Deno.env.get('NEXTJS_BASE_URL')! // e.g. https://kairo-omega.vercel.app
+const TELEGRAM_BOT_TOKEN = Deno.env.get('TELEGRAM_BOT_TOKEN') // optional — set when bot is created
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY)
 
@@ -19,7 +21,30 @@ const PLAN_LIMITS: Record<string, number> = {
   unlimited: 999999,
 }
 
-// ─── Reddit RSS fetching (Deno-compatible, no Next.js route needed) ───────
+const UNLIMITED_EMAIL = 'bundepunemmanuel@gmail.com'
+
+// ─── Reddit fetching — via Next.js proxy, NOT direct from Deno ───────────
+// Reddit blocks/throttles requests from Supabase Edge Function IPs.
+// The Next.js /api/reddit route already works reliably from Vercel's infra.
+async function fetchSubreddit(subreddit: string) {
+  try {
+    const res = await fetch(
+      `${NEXTJS_BASE_URL}/api/reddit?sub=${encodeURIComponent(subreddit)}&sort=new`,
+      { signal: AbortSignal.timeout(15000) }
+    )
+    if (!res.ok) {
+      console.log(`[cron-scan] reddit proxy failed for r/${subreddit}: ${res.status}`)
+      return []
+    }
+    const xml = await res.text()
+    if (!xml.includes('<entry>')) return []
+    return parseAtom(xml, subreddit)
+  } catch (e) {
+    console.log(`[cron-scan] reddit proxy error for r/${subreddit}:`, e.message)
+    return []
+  }
+}
+
 function parseAtom(xml: string, subreddit: string) {
   const posts = []
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)]
@@ -52,33 +77,14 @@ function parseAtom(xml: string, subreddit: string) {
   return posts
 }
 
-async function fetchSubreddit(subreddit: string) {
-  const sorts = ['new', 'hot']
-  for (const sort of sorts) {
-    try {
-      const res = await fetch(`https://www.reddit.com/r/${subreddit}/${sort}.rss?limit=25`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        },
-        signal: AbortSignal.timeout(10000),
-      })
-      const text = await res.text()
-      if (!text.includes('<entry>')) continue
-      return parseAtom(text, subreddit)
-    } catch {
-      continue
-    }
-  }
-  return []
-}
-
-// ─── Scoring (calls existing Next.js /api/score route — reuses all the prompt logic) ───
+// ─── Scoring — calls existing Next.js /api/score route ──────────────────
 async function scorePosts(posts: any[], analysis: any) {
   try {
     const res = await fetch(`${NEXTJS_BASE_URL}/api/score`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ posts, analysis }),
+      signal: AbortSignal.timeout(30000),
     })
     const data = await res.json()
     return data.leads || []
@@ -88,12 +94,31 @@ async function scorePosts(posts: any[], analysis: any) {
   }
 }
 
+// ─── Telegram notification ───────────────────────────────────────────────
+async function sendTelegramNotification(chatId: string, lead: any) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return
+  try {
+    const message = `🎯 *New Kairo Lead* (Score: ${lead.score})\n\n*${lead.title}*\n\nr/${lead.subreddit} · ${lead.signalType === 'active' ? '🔴 Active Demand' : '🟡 Passive Demand'}\n\n_${lead.specificProblem || lead.reason}_\n\n${lead.url}`
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+        parse_mode: 'Markdown',
+      }),
+      signal: AbortSignal.timeout(8000),
+    })
+  } catch (e) {
+    console.log('[cron-scan] telegram send error:', e.message)
+  }
+}
+
 // ─── Main handler ──────────────────────────────────────────────────────
 Deno.serve(async (req) => {
   console.log('[cron-scan] starting run at', new Date().toISOString())
 
   try {
-    // Get all users with a saved product profile
     const { data: profiles, error: profilesErr } = await supabase
       .from('product_profiles')
       .select('user_id, url, analysis')
@@ -106,13 +131,22 @@ Deno.serve(async (req) => {
 
     console.log(`[cron-scan] found ${profiles.length} profiles to check`)
 
+    // Ensure the hardcoded unlimited account always has the right plan
+    const { data: unlimitedUser } = await supabase.auth.admin.listUsers()
+    const unlimitedAccount = unlimitedUser?.users?.find((u: any) => u.email === UNLIMITED_EMAIL)
+    if (unlimitedAccount) {
+      await supabase.from('user_plans').upsert(
+        { user_id: unlimitedAccount.id, plan: 'unlimited', updated_at: new Date().toISOString() },
+        { onConflict: 'user_id' }
+      )
+    }
+
     let processedCount = 0
     let skippedCount = 0
 
     for (const profile of profiles) {
       const userId = profile.user_id
 
-      // Get user's plan
       const { data: planRow } = await supabase
         .from('user_plans')
         .select('plan')
@@ -122,8 +156,6 @@ Deno.serve(async (req) => {
       const plan = planRow?.plan || 'free'
       const limit = PLAN_LIMITS[plan] ?? 3
 
-      // Count leads created for this user in the last 24 hours
-      // IMPORTANT: count ALL leads regardless of deleted flag — deletion doesn't refund quota
       const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
       const { count } = await supabase
         .from('leads')
@@ -141,7 +173,6 @@ Deno.serve(async (req) => {
 
       const remainingQuota = limit - leadsToday
 
-      // Fetch fresh Reddit posts using the SAVED analysis — no Jina, no analyze call
       const analysis = profile.analysis
       const subreddits = (analysis.subreddits || []).slice(0, 6)
       const postArrays = await Promise.all(subreddits.map(fetchSubreddit))
@@ -149,12 +180,13 @@ Deno.serve(async (req) => {
         p.body && p.body.length > 40 && !p.body.includes('[comments]')
       )
 
+      console.log(`[cron-scan] user ${userId}: fetched ${allPosts.length} posts across ${subreddits.length} subreddits`)
+
       if (!allPosts.length) {
         console.log(`[cron-scan] user ${userId}: no posts fetched`)
         continue
       }
 
-      // Score against saved analysis
       const scoredLeads = await scorePosts(allPosts, analysis)
 
       if (!scoredLeads.length) {
@@ -162,10 +194,8 @@ Deno.serve(async (req) => {
         continue
       }
 
-      // Only take up to remaining quota
       const leadsToInsert = scoredLeads.slice(0, remainingQuota)
 
-      // Avoid inserting duplicate posts (same post_id already exists for this user)
       const { data: existingLeads } = await supabase
         .from('leads')
         .select('post_id')
@@ -179,7 +209,6 @@ Deno.serve(async (req) => {
         continue
       }
 
-      // APPEND new leads — never delete old ones (per product requirement)
       const { error: insertErr } = await supabase.from('leads').insert(
         newLeads.map((lead: any) => ({
           user_id: userId,
@@ -205,6 +234,27 @@ Deno.serve(async (req) => {
 
       console.log(`[cron-scan] user ${userId} (${plan}): added ${newLeads.length} new leads (${leadsToday + newLeads.length}/${limit} today)`)
       processedCount++
+
+      // Send Telegram notifications if user has it configured
+      try {
+        const { data: settings } = await supabase
+          .from('user_settings')
+          .select('telegram_chat_id, notify_frequency')
+          .eq('user_id', userId)
+          .single()
+
+        if (settings?.telegram_chat_id) {
+          const leadsToNotify = settings.notify_frequency === 'critical_only'
+            ? newLeads.filter((l: any) => l.score >= 8)
+            : newLeads
+
+          for (const lead of leadsToNotify) {
+            await sendTelegramNotification(settings.telegram_chat_id, lead)
+          }
+        }
+      } catch (e) {
+        console.log(`[cron-scan] telegram check error for user ${userId}:`, e.message)
+      }
     }
 
     console.log(`[cron-scan] run complete: ${processedCount} processed, ${skippedCount} skipped (quota)`)
