@@ -109,3 +109,50 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 -- INSERT INTO user_plans (user_id, plan)
 -- SELECT id, 'unlimited' FROM auth.users WHERE email = 'bundepunemmanuel@gmail.com'
 -- ON CONFLICT (user_id) DO UPDATE SET plan = 'unlimited';
+
+
+
+
+
+-- Kairo Chunk 6 schema additions
+
+-- Fix: leads table was missing UPDATE policy (this is why Replied/Delete buttons
+-- appeared to do nothing — Supabase silently blocks RLS-denied updates)
+-- Postgres has no "CREATE POLICY IF NOT EXISTS" syntax, so we drop first if it
+-- exists, then create — this makes the script safely re-runnable.
+DROP POLICY IF EXISTS "Users can update own leads" ON leads;
+CREATE POLICY "Users can update own leads" ON leads
+  FOR UPDATE USING (auth.uid() = user_id);
+
+-- User settings table — Telegram notifications, notify frequency
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,
+  telegram_chat_id TEXT,
+  notify_frequency TEXT NOT NULL DEFAULT 'all', -- 'all' or 'critical_only'
+  last_active_at TIMESTAMPTZ DEFAULT NOW(),
+  last_seen_leads_at TIMESTAMPTZ DEFAULT NOW(), -- used to compute "New" lead badges
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE user_settings ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can view own settings" ON user_settings;
+CREATE POLICY "Users can view own settings" ON user_settings
+  FOR SELECT USING (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can insert own settings" ON user_settings;
+CREATE POLICY "Users can insert own settings" ON user_settings
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can update own settings" ON user_settings;
+CREATE POLICY "Users can update own settings" ON user_settings
+  FOR UPDATE USING (auth.uid() = user_id);
+
+-- Add last_scan_at to product_profiles — shown in Settings as "Last scanned: X ago"
+ALTER TABLE product_profiles ADD COLUMN IF NOT EXISTS last_scan_at TIMESTAMPTZ DEFAULT NOW();
+
+-- Set the hardcoded unlimited account (run after they've signed up at least once)
+-- The Edge Function also enforces this automatically on every cron run as a safety net.
+INSERT INTO user_plans (user_id, plan)
+SELECT id, 'unlimited' FROM auth.users WHERE email = 'bundepunemmanuel@gmail.com'
+ON CONFLICT (user_id) DO UPDATE SET plan = 'unlimited';
