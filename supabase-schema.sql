@@ -66,3 +66,46 @@ CREATE POLICY "Users can insert own leads" ON leads
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 CREATE POLICY "Users can delete own leads" ON leads
   FOR DELETE USING (auth.uid() = user_id);
+
+
+
+-- Kairo Chunk 4 — Cron job schema additions
+-- Adds: plan field, deleted flag on leads, quota tracking
+
+-- Add plan column to track each user's tier
+CREATE TABLE IF NOT EXISTS user_plans (
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,
+  plan TEXT NOT NULL DEFAULT 'free', -- free, starter, pro, unlimited
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE user_plans ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own plan" ON user_plans
+  FOR SELECT USING (auth.uid() = user_id);
+
+-- Add a deleted flag to leads — deletion hides from view but doesn't affect quota
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE;
+
+-- Add replied flag — moves lead to "replied" section without deleting
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS replied BOOLEAN DEFAULT FALSE;
+
+-- Function to get plan daily lead limit
+CREATE OR REPLACE FUNCTION get_plan_limit(p_plan TEXT)
+RETURNS INTEGER AS $$
+BEGIN
+  RETURN CASE p_plan
+    WHEN 'free' THEN 3
+    WHEN 'starter' THEN 10
+    WHEN 'pro' THEN 50
+    WHEN 'unlimited' THEN 999999
+    ELSE 3
+  END;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- Set the hardcoded unlimited account
+-- Run this after the account has signed up at least once
+-- INSERT INTO user_plans (user_id, plan)
+-- SELECT id, 'unlimited' FROM auth.users WHERE email = 'bundepunemmanuel@gmail.com'
+-- ON CONFLICT (user_id) DO UPDATE SET plan = 'unlimited';
