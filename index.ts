@@ -143,6 +143,11 @@ Deno.serve(async (req) => {
 
     let processedCount = 0
     let skippedCount = 0
+    let noPostsCount = 0
+    let noLeadsCount = 0
+    let allSeenCount = 0
+    let insertErrorCount = 0
+    const debug: any[] = []
 
     for (const profile of profiles) {
       const userId = profile.user_id
@@ -184,6 +189,8 @@ Deno.serve(async (req) => {
 
       if (!allPosts.length) {
         console.log(`[cron-scan] user ${userId}: no posts fetched`)
+        noPostsCount++
+        debug.push({ userId, reason: 'no_posts_fetched', subreddits, nextjsBaseUrl: NEXTJS_BASE_URL })
         continue
       }
 
@@ -191,6 +198,8 @@ Deno.serve(async (req) => {
 
       if (!scoredLeads.length) {
         console.log(`[cron-scan] user ${userId}: no qualifying leads this run`)
+        noLeadsCount++
+        debug.push({ userId, reason: 'no_qualifying_leads', postsScanned: allPosts.length })
         continue
       }
 
@@ -206,6 +215,8 @@ Deno.serve(async (req) => {
 
       if (!newLeads.length) {
         console.log(`[cron-scan] user ${userId}: all leads already seen, no new inserts`)
+        allSeenCount++
+        debug.push({ userId, reason: 'all_leads_already_seen', scoredCount: leadsToInsert.length })
         continue
       }
 
@@ -229,6 +240,8 @@ Deno.serve(async (req) => {
 
       if (insertErr) {
         console.log(`[cron-scan] user ${userId} insert error:`, insertErr.message)
+        insertErrorCount++
+        debug.push({ userId, reason: 'insert_error', message: insertErr.message })
         continue
       }
 
@@ -260,7 +273,16 @@ Deno.serve(async (req) => {
     console.log(`[cron-scan] run complete: ${processedCount} processed, ${skippedCount} skipped (quota)`)
 
     return new Response(
-      JSON.stringify({ processed: processedCount, skipped: skippedCount, total: profiles.length }),
+      JSON.stringify({
+        processed: processedCount,
+        skipped: skippedCount,
+        total: profiles.length,
+        noPostsFetched: noPostsCount,
+        noQualifyingLeads: noLeadsCount,
+        allLeadsAlreadySeen: allSeenCount,
+        insertErrors: insertErrorCount,
+        debug,
+      }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     )
   } catch (err) {
