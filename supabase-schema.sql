@@ -156,3 +156,37 @@ ALTER TABLE product_profiles ADD COLUMN IF NOT EXISTS last_scan_at TIMESTAMPTZ D
 INSERT INTO user_plans (user_id, plan)
 SELECT id, 'unlimited' FROM auth.users WHERE email = 'bundepunemmanuel@gmail.com'
 ON CONFLICT (user_id) DO UPDATE SET plan = 'unlimited';
+
+
+
+
+
+
+
+
+-- Run this in Supabase SQL Editor before deploying billing.js
+
+create table if not exists upgrade_requests (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  requested_plan text not null check (requested_plan in ('starter', 'pro', 'unlimited')),
+  created_at timestamptz not null default now()
+);
+
+alter table upgrade_requests enable row level security;
+
+-- Users can insert their own upgrade request
+create policy "Users can create their own upgrade requests"
+  on upgrade_requests for insert
+  with check (auth.uid() = user_id);
+
+-- Users can see their own upgrade requests (so billing.js can show
+-- "you're on the list" after a page refresh, not just right after clicking)
+create policy "Users can view their own upgrade requests"
+  on upgrade_requests for select
+  using (auth.uid() = user_id);
+
+-- No update/delete policy — requests are immutable once created.
+-- Admin reads happen via the service role key in /api/admin.js, which
+-- bypasses RLS entirely, so no admin-specific policy is needed here.
+
