@@ -181,9 +181,22 @@ Deno.serve(async (req) => {
       const analysis = profile.analysis
       const subreddits = (analysis.subreddits || []).slice(0, 6)
       const postArrays = await Promise.all(subreddits.map(fetchSubreddit))
-      const allPosts = postArrays.flat().filter((p: any) =>
-        p.body && p.body.length > 40 && !p.body.includes('[comments]')
+      const filteredArrays = postArrays.map((arr: any[]) =>
+        arr.filter((p: any) => p.body && p.body.length > 40 && !p.body.includes('[comments]'))
       )
+
+      // Round-robin interleave across subreddits (one post from sub A, one
+      // from sub B, one from sub C... then back to A) instead of
+      // concatenating in order. Otherwise, when we only score the first N
+      // posts downstream, whichever subreddit is listed first silently
+      // hogs every scoring slot and the rest are never evaluated at all.
+      const allPosts: any[] = []
+      const maxLen = Math.max(0, ...filteredArrays.map(a => a.length))
+      for (let i = 0; i < maxLen; i++) {
+        for (const arr of filteredArrays) {
+          if (arr[i]) allPosts.push(arr[i])
+        }
+      }
 
       console.log(`[cron-scan] user ${userId}: fetched ${allPosts.length} posts across ${subreddits.length} subreddits`)
 
