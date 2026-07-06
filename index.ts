@@ -149,6 +149,21 @@ Deno.serve(async (req) => {
     let insertErrorCount = 0
     const debug: any[] = []
 
+    // Groq's free-tier limit is 8,000 tokens/minute, shared across ALL
+    // calls on this account. If two users' scoring calls land in the same
+    // ~60s window, the second one gets rejected outright. Staggering by
+    // ~20s keeps each call in a different slice of that rolling window.
+    //
+    // NOTE — scaling ceiling: Supabase's free-tier Edge Functions have a
+    // hard 150s wall-clock limit per run. At a 20s stagger, that leaves
+    // room for roughly 7 users before the delays alone exceed the budget
+    // (before counting actual fetch/score time). If you grow past ~5-6
+    // users, this loop will need to move to smaller batches (e.g. a
+    // separate invocation per user, or per few users) instead of one
+    // single run looping through everyone.
+    const STAGGER_MS = 20000
+    let isFirstScoredUser = true
+
     for (const profile of profiles) {
       const userId = profile.user_id
 
@@ -175,6 +190,14 @@ Deno.serve(async (req) => {
         skippedCount++
         continue
       }
+
+      // Only stagger between users that actually reach a scoring call —
+      // no point burning time budget delaying in front of a skip.
+      if (!isFirstScoredUser) {
+        console.log(`[cron-scan] waiting ${STAGGER_MS / 1000}s before next user (rate-limit spacing)`)
+        await new Promise(r => setTimeout(r, STAGGER_MS))
+      }
+      isFirstScoredUser = false
 
       const remainingQuota = limit - leadsToday
 
