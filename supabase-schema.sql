@@ -158,6 +158,20 @@ SELECT id, 'unlimited' FROM auth.users WHERE email = 'bundepunemmanuel@gmail.com
 ON CONFLICT (user_id) DO UPDATE SET plan = 'unlimited';
 
 
+-- Run in Supabase SQL Editor before deploying the conversation-loop changes
+
+-- conversation: ordered array of { role: 'sent' | 'them', text, at }
+--   'sent'  = what the Kairo user actually posted (after their required edit/confirm)
+--   'them'  = what the thread owner replied with (pasted in by the user)
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS conversation JSONB DEFAULT '[]'::jsonb;
+
+-- 'open'   = AI thinks this is still worth following up on
+-- 'closed' = AI judged the thread owner isn't a fit / conversation resolved —
+--            stop suggesting follow-ups for this lead
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS conversation_status TEXT DEFAULT 'open'
+  CHECK (conversation_status IN ('open', 'closed'));
+
+
 
 
 
