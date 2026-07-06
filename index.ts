@@ -1,16 +1,15 @@
 // Supabase Edge Function — cron-scan
-// Runs every 30 minutes via pg_cron
+// Runs hourly via pg_cron
 // For each user under their daily quota: fetch fresh Reddit posts via the
 // Next.js /api/reddit proxy (fixes Reddit blocking direct Deno fetches),
-// score using their SAVED analysis (no Jina/Groq analyze call), append new
-// leads, and send Telegram notifications if configured.
+// dedup against already-scored posts, score using their SAVED analysis,
+// append new leads. Also refreshes each product's analysis weekly.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 const NEXTJS_BASE_URL = Deno.env.get('NEXTJS_BASE_URL')! // e.g. https://kairo-omega.vercel.app
-const TELEGRAM_BOT_TOKEN = Deno.env.get('TELEGRAM_BOT_TOKEN') // optional — set when bot is created
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY)
 
@@ -87,30 +86,30 @@ async function scorePosts(posts: any[], analysis: any) {
       signal: AbortSignal.timeout(30000),
     })
     const data = await res.json()
-    return data.leads || []
+    return { leads: data.leads || [], scoredUrls: data.scoredUrls || [] }
   } catch (e) {
     console.log('[cron-scan] score error:', e.message)
-    return []
+    return { leads: [], scoredUrls: [] }
   }
 }
 
-// ─── Telegram notification ───────────────────────────────────────────────
-async function sendTelegramNotification(chatId: string, lead: any) {
-  if (!TELEGRAM_BOT_TOKEN || !chatId) return
+// ─── Weekly re-analyze — calls existing Next.js /api/analyze route ──────
+// Refreshes name/description/subreddits so scoring stays accurate as a
+// product evolves. Subreddits are no longer user-editable, so it's safe
+// to overwrite the full analysis object here.
+async function reanalyzeProduct(url: string) {
   try {
-    const message = `🎯 *New Kairo Lead* (Score: ${lead.score})\n\n*${lead.title}*\n\nr/${lead.subreddit} · ${lead.signalType === 'active' ? '🔴 Active Demand' : '🟡 Passive Demand'}\n\n_${lead.specificProblem || lead.reason}_\n\n${lead.url}`
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    const res = await fetch(`${NEXTJS_BASE_URL}/api/analyze`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: message,
-        parse_mode: 'Markdown',
-      }),
-      signal: AbortSignal.timeout(8000),
+      body: JSON.stringify({ url }),
+      signal: AbortSignal.timeout(30000),
     })
+    const data = await res.json()
+    return data.analysis || null
   } catch (e) {
-    console.log('[cron-scan] telegram send error:', e.message)
+    console.log('[cron-scan] re-analyze error:', e.message)
+    return null
   }
 }
 
@@ -121,7 +120,7 @@ Deno.serve(async (req) => {
   try {
     const { data: profiles, error: profilesErr } = await supabase
       .from('product_profiles')
-      .select('user_id, url, analysis')
+      .select('user_id, url, analysis, last_analyzed_at')
 
     if (profilesErr) throw profilesErr
     if (!profiles?.length) {
@@ -201,12 +200,44 @@ Deno.serve(async (req) => {
 
       const remainingQuota = limit - leadsToday
 
-      const analysis = profile.analysis
+      // Weekly re-analyze — refresh name/description/subreddits so scoring
+      // stays accurate as the product evolves. Runs before this user's
+      // scan so a freshly-updated subreddit list is used immediately.
+      let analysis = profile.analysis
+      const REANALYZE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000
+      const lastAnalyzed = profile.last_analyzed_at ? new Date(profile.last_analyzed_at).getTime() : 0
+      if (Date.now() - lastAnalyzed > REANALYZE_INTERVAL_MS) {
+        console.log(`[cron-scan] user ${userId}: re-analyzing product (last analyzed ${profile.last_analyzed_at || 'never'})`)
+        const freshAnalysis = await reanalyzeProduct(profile.url)
+        if (freshAnalysis) {
+          analysis = freshAnalysis
+          await supabase
+            .from('product_profiles')
+            .update({ analysis: freshAnalysis, last_analyzed_at: new Date().toISOString() })
+            .eq('user_id', userId)
+          console.log(`[cron-scan] user ${userId}: analysis refreshed`)
+        } else {
+          console.log(`[cron-scan] user ${userId}: re-analyze failed, using existing analysis`)
+        }
+      }
+
       const subreddits = (analysis.subreddits || []).slice(0, 6)
       const postArrays = await Promise.all(subreddits.map(fetchSubreddit))
       const filteredArrays = postArrays.map((arr: any[]) =>
         arr.filter((p: any) => p.body && p.body.length > 40 && !p.body.includes('[comments]'))
       )
+
+      // Dedup — skip any post already sent to an AI for scoring before,
+      // regardless of whether it qualified as a lead. This was the single
+      // biggest source of wasted tokens: the same posts were being
+      // re-scored every run since Reddit's "new" feed doesn't fully
+      // refresh every 30-60 minutes on smaller subreddits.
+      const { data: seenRows } = await supabase
+        .from('seen_posts')
+        .select('post_url')
+        .eq('user_id', userId)
+      const seenUrls = new Set((seenRows || []).map((r: any) => r.post_url))
+      const freshArrays = filteredArrays.map((arr: any[]) => arr.filter((p: any) => !seenUrls.has(p.url)))
 
       // Round-robin interleave across subreddits (one post from sub A, one
       // from sub B, one from sub C... then back to A) instead of
@@ -214,23 +245,43 @@ Deno.serve(async (req) => {
       // posts downstream, whichever subreddit is listed first silently
       // hogs every scoring slot and the rest are never evaluated at all.
       const allPosts: any[] = []
-      const maxLen = Math.max(0, ...filteredArrays.map(a => a.length))
+      const maxLen = Math.max(0, ...freshArrays.map(a => a.length))
       for (let i = 0; i < maxLen; i++) {
-        for (const arr of filteredArrays) {
+        for (const arr of freshArrays) {
           if (arr[i]) allPosts.push(arr[i])
         }
       }
 
-      console.log(`[cron-scan] user ${userId}: fetched ${allPosts.length} posts across ${subreddits.length} subreddits`)
+      const totalFetched = filteredArrays.reduce((sum, arr) => sum + arr.length, 0)
+      console.log(`[cron-scan] user ${userId}: fetched ${totalFetched} posts, ${allPosts.length} genuinely new across ${subreddits.length} subreddits`)
 
-      if (!allPosts.length) {
+      if (!totalFetched) {
         console.log(`[cron-scan] user ${userId}: no posts fetched`)
         noPostsCount++
         debug.push({ userId, reason: 'no_posts_fetched', subreddits, nextjsBaseUrl: NEXTJS_BASE_URL })
         continue
       }
 
-      const scoredLeads = await scorePosts(allPosts, analysis)
+      if (!allPosts.length) {
+        console.log(`[cron-scan] user ${userId}: ${totalFetched} posts fetched, all already scored before — nothing new`)
+        noPostsCount++
+        debug.push({ userId, reason: 'all_posts_already_seen', totalFetched })
+        continue
+      }
+
+      const { leads: scoredLeads, scoredUrls } = await scorePosts(allPosts, analysis)
+
+      // Record every post actually sent to scoring as seen — whether it
+      // qualified as a lead or not — so it's never re-scored again.
+      if (scoredUrls.length) {
+        const { error: seenErr } = await supabase
+          .from('seen_posts')
+          .upsert(
+            scoredUrls.map((url: string) => ({ user_id: userId, post_url: url })),
+            { onConflict: 'user_id,post_url', ignoreDuplicates: true }
+          )
+        if (seenErr) console.log(`[cron-scan] user ${userId}: seen_posts write error:`, seenErr.message)
+      }
 
       if (!scoredLeads.length) {
         console.log(`[cron-scan] user ${userId}: no qualifying leads this run`)
@@ -283,27 +334,6 @@ Deno.serve(async (req) => {
 
       console.log(`[cron-scan] user ${userId} (${plan}): added ${newLeads.length} new leads (${leadsToday + newLeads.length}/${limit} today)`)
       processedCount++
-
-      // Send Telegram notifications if user has it configured
-      try {
-        const { data: settings } = await supabase
-          .from('user_settings')
-          .select('telegram_chat_id, notify_frequency')
-          .eq('user_id', userId)
-          .single()
-
-        if (settings?.telegram_chat_id) {
-          const leadsToNotify = settings.notify_frequency === 'critical_only'
-            ? newLeads.filter((l: any) => l.score >= 8)
-            : newLeads
-
-          for (const lead of leadsToNotify) {
-            await sendTelegramNotification(settings.telegram_chat_id, lead)
-          }
-        }
-      } catch (e) {
-        console.log(`[cron-scan] telegram check error for user ${userId}:`, e.message)
-      }
     }
 
     console.log(`[cron-scan] run complete: ${processedCount} processed, ${skippedCount} skipped (quota)`)
