@@ -204,3 +204,31 @@ create policy "Users can view their own upgrade requests"
 -- Admin reads happen via the service role key in /api/admin.js, which
 -- bypasses RLS entirely, so no admin-specific policy is needed here.
 
+
+
+-- Run in Supabase SQL Editor before deploying the new index.ts / score.js
+
+-- Tracks every post URL ever sent to an AI for scoring, per user — whether
+-- it qualified as a lead or not. Lets cron-scan skip re-scoring the same
+-- post twice, which was the single biggest source of wasted tokens.
+CREATE TABLE IF NOT EXISTS seen_posts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  post_url TEXT NOT NULL,
+  scored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, post_url)
+);
+
+CREATE INDEX IF NOT EXISTS seen_posts_user_id_idx ON seen_posts (user_id);
+
+-- No RLS needed — this table is only ever touched by cron-scan via the
+-- service role key, never read/written from the client.
+
+-- Tracks when a product's analysis (name/description/subreddits) was last
+-- refreshed, separate from last_scan_at (which tracks Reddit scanning).
+ALTER TABLE product_profiles ADD COLUMN IF NOT EXISTS last_analyzed_at TIMESTAMPTZ;
+
+-- Housekeeping note (not automated, run manually every so often):
+-- old seen_posts rows are harmless but grow forever. Reddit's "new" feed
+-- won't resurface anything this old, so periodically pruning is safe:
+--   DELETE FROM seen_posts WHERE scored_at < now() - interval '60 days';
