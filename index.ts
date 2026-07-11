@@ -106,6 +106,13 @@ async function reanalyzeProduct(url: string) {
       signal: AbortSignal.timeout(30000),
     })
     const data = await res.json()
+    // isFallback means all 3 models failed and this is just a generic
+    // placeholder — never let that overwrite a perfectly good existing
+    // analysis. Treat it the same as a failed re-analyze.
+    if (data.isFallback) {
+      console.log('[cron-scan] re-analyze returned a fallback (all models failed) — keeping existing analysis')
+      return null
+    }
     return data.analysis || null
   } catch (e) {
     console.log('[cron-scan] re-analyze error:', e.message)
