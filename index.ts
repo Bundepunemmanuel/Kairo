@@ -231,7 +231,7 @@ Deno.serve(async (req) => {
       const subreddits = (analysis.subreddits || []).slice(0, 6)
       const postArrays = await Promise.all(subreddits.map(fetchSubreddit))
       const filteredArrays = postArrays.map((arr: any[]) =>
-        arr.filter((p: any) => p.body && p.body.length > 40 && !p.body.includes('[comments]'))
+        arr.filter((p: any) => p.body && p.body.length > 40)
       )
 
       // Dedup — skip any post already sent to an AI for scoring before,
