@@ -161,12 +161,14 @@ Deno.serve(async (req) => {
     // ~20s keeps each call in a different slice of that rolling window.
     //
     // NOTE — scaling ceiling: Supabase's free-tier Edge Functions have a
-    // hard 150s wall-clock limit per run. At a 20s stagger, that leaves
-    // room for roughly 7 users before the delays alone exceed the budget
-    // (before counting actual fetch/score time). If you grow past ~5-6
-    // users, this loop will need to move to smaller batches (e.g. a
-    // separate invocation per user, or per few users) instead of one
-    // single run looping through everyone.
+    // hard 150s wall-clock limit per run. Between the 20s user stagger AND
+    // the sequential subreddit fetch (up to 6 subreddits x 1.5s pause =
+    // ~9s added per user), the realistic ceiling is now closer to 4-5
+    // users before delays alone exceed the budget (before counting actual
+    // fetch/score time on top). If you grow past that, this loop will
+    // need to move to smaller batches (e.g. a separate invocation per
+    // user, or per few users) instead of one single run looping through
+    // everyone.
     const STAGGER_MS = 20000
     let isFirstScoredUser = true
 
@@ -229,7 +231,54 @@ Deno.serve(async (req) => {
       }
 
       const subreddits = (analysis.subreddits || []).slice(0, 6)
-      const postArrays = await Promise.all(subreddits.map(fetchSubreddit))
+
+      // Fetch subreddits ONE AT A TIME with a short pause between each,
+      // instead of all 6 simultaneously via Promise.all. A burst of 6
+      // concurrent requests from the same IP appears to get silently
+      // emptied out by Reddit sometimes — confirmed by testing subreddits
+      // individually (all returned real posts) vs. via the cron's
+      // concurrent burst (returned 0 for all 6). Sequential, spaced-out
+      // requests mirror what a real browser/manual test does, which we
+      // know works.
+      const FETCH_PAUSE_MS = 1500
+      const postArrays: any[][] = []
+      for (let i = 0; i < subreddits.length; i++) {
+        const sub = subreddits[i]
+        const posts = await fetchSubreddit(sub)
+        postArrays.push(posts)
+
+        // Dead-subreddit detection — track consecutive 0-post runs per
+        // user+subreddit. Surfaces renamed/banned/dead subreddits (like
+        // the producthunt case) automatically, instead of only catching
+        // it when a user notices missing leads and manually investigates.
+        if (posts.length === 0) {
+          const { data: healthRow } = await supabase
+            .from('subreddit_health')
+            .select('consecutive_zero_runs')
+            .eq('user_id', userId)
+            .eq('subreddit', sub)
+            .single()
+          const newStreak = (healthRow?.consecutive_zero_runs || 0) + 1
+          await supabase.from('subreddit_health').upsert(
+            { user_id: userId, subreddit: sub, consecutive_zero_runs: newStreak, last_checked_at: new Date().toISOString() },
+            { onConflict: 'user_id,subreddit' }
+          )
+          if (newStreak >= 3) {
+            console.log(`[cron-scan] WARNING: r/${sub} has returned 0 posts for ${newStreak} consecutive runs (user ${userId}) — likely dead, renamed, or banned subreddit`)
+          }
+        } else {
+          // Returned posts — reset the streak.
+          await supabase.from('subreddit_health').upsert(
+            { user_id: userId, subreddit: sub, consecutive_zero_runs: 0, last_checked_at: new Date().toISOString() },
+            { onConflict: 'user_id,subreddit' }
+          )
+        }
+
+        if (i < subreddits.length - 1) {
+          await new Promise(r => setTimeout(r, FETCH_PAUSE_MS))
+        }
+      }
+
       const filteredArrays = postArrays.map((arr: any[]) =>
         arr.filter((p: any) => p.body && p.body.length > 40)
       )
