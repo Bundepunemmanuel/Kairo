@@ -120,6 +120,71 @@ async function reanalyzeProduct(url: string) {
   }
 }
 
+// Phrases that indicate a subreddit bans vendor/promotional replies —
+// checked against the subreddit's combined rules text + public
+// description. Intentionally broad; a false positive here just means an
+// extra subreddit writes plug-free replies, which is a safe failure mode.
+// A false negative (missing a real ban) risks a removed comment instead.
+const NO_PITCH_PHRASES = [
+  'no self promo', 'no self-promo', 'no promotion', 'no advertising',
+  'no vendor', 'no soliciting', 'no selling', 'vendor spam',
+  'no ai content', 'no low effort', 'no low-effort',
+  "i'll review your product", 'no marketing', 'sticky thread only',
+  'stickied thread', 'no link dropping', 'no links to your',
+]
+
+const RULES_CACHE_DAYS = 30
+
+// Auto-detects whether a subreddit bans self-promotion, caching the
+// result for 30 days so we're not re-fetching rules on every run. Seeds
+// from real evidence (r/SaaS, r/loseit, etc. all confirmed via actual
+// removals or explicit posted rules) rather than a hardcoded guess list —
+// this scales to any subreddit Kairo ever touches, not just the ones a
+// user happens to notice a removal in.
+async function checkSubredditRules(sub: string) {
+  try {
+    const { data: existing } = await supabase
+      .from('subreddit_rules')
+      .select('checked_at')
+      .eq('subreddit', sub.toLowerCase())
+      .single()
+
+    if (existing?.checked_at) {
+      const ageMs = Date.now() - new Date(existing.checked_at).getTime()
+      if (ageMs < RULES_CACHE_DAYS * 24 * 60 * 60 * 1000) {
+        return // cached and still fresh, nothing to do
+      }
+    }
+
+    const res = await fetch(
+      `${NEXTJS_BASE_URL}/api/reddit?sub=${encodeURIComponent(sub)}&mode=rules`,
+      { signal: AbortSignal.timeout(15000) }
+    )
+    const data = await res.json()
+    const rulesText = (data.rulesText || '').toLowerCase()
+    const noPitch = NO_PITCH_PHRASES.some(phrase => rulesText.includes(phrase))
+
+    await supabase.from('subreddit_rules').upsert(
+      {
+        subreddit: sub.toLowerCase(),
+        no_pitch: noPitch,
+        raw_rules_text: rulesText.slice(0, 2000),
+        checked_at: new Date().toISOString(),
+      },
+      { onConflict: 'subreddit' }
+    )
+
+    if (noPitch) {
+      console.log(`[cron-scan] r/${sub}: detected as no-pitch subreddit`)
+    }
+  } catch (e) {
+    console.log(`[cron-scan] rules check error for r/${sub}:`, e.message)
+    // Fail quiet — a missed rules-refresh just means we use whatever's
+    // already cached (or no entry at all, which reply.js treats as safe
+    // to pitch). Not worth failing the whole scan over.
+  }
+}
+
 // ─── Main handler ──────────────────────────────────────────────────────
 Deno.serve(async (req) => {
   console.log('[cron-scan] starting run at', new Date().toISOString())
@@ -127,7 +192,7 @@ Deno.serve(async (req) => {
   try {
     const { data: profiles, error: profilesErr } = await supabase
       .from('product_profiles')
-      .select('user_id, url, analysis, last_analyzed_at')
+      .select('user_id, url, analysis, last_analyzed_at, last_cron_attempt_at')
 
     if (profilesErr) throw profilesErr
     if (!profiles?.length) {
@@ -136,6 +201,40 @@ Deno.serve(async (req) => {
     }
 
     console.log(`[cron-scan] found ${profiles.length} profiles to check`)
+
+    // ── Batching ──────────────────────────────────────────────────────
+    // Only take a small batch per invocation, so we never risk hitting
+    // Supabase's 150s function-execution ceiling as user count grows.
+    // pg_cron triggers hourly as the main entrypoint; if users remain
+    // unprocessed after this batch, we dynamically schedule a one-time
+    // follow-up run ~2 minutes out via schedule_followup_batch(), which
+    // repeats until the whole hour's queue is empty.
+    const BATCH_SIZE = 3
+    const now = new Date()
+    const startOfHour = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours())
+
+    const notYetAttemptedThisHour = profiles.filter((p: any) => {
+      if (!p.last_cron_attempt_at) return true
+      return new Date(p.last_cron_attempt_at) < startOfHour
+    })
+
+    // Oldest-attempted-first, so no one gets starved indefinitely if the
+    // user count ever grows past what a single hour's batches can cover.
+    notYetAttemptedThisHour.sort((a: any, b: any) => {
+      const aTime = a.last_cron_attempt_at ? new Date(a.last_cron_attempt_at).getTime() : 0
+      const bTime = b.last_cron_attempt_at ? new Date(b.last_cron_attempt_at).getTime() : 0
+      return aTime - bTime
+    })
+
+    const batch = notYetAttemptedThisHour.slice(0, BATCH_SIZE)
+    const remainingAfterThisBatch = notYetAttemptedThisHour.length - batch.length
+
+    if (!batch.length) {
+      console.log('[cron-scan] all profiles already attempted this hour — nothing to do')
+      return new Response(JSON.stringify({ processed: 0, message: 'all done this hour' }), { status: 200 })
+    }
+
+    console.log(`[cron-scan] processing batch of ${batch.length} (${remainingAfterThisBatch} remaining this hour)`)
 
     // Ensure the hardcoded unlimited account always has the right plan
     const { data: unlimitedUser } = await supabase.auth.admin.listUsers()
@@ -160,20 +259,27 @@ Deno.serve(async (req) => {
     // ~60s window, the second one gets rejected outright. Staggering by
     // ~20s keeps each call in a different slice of that rolling window.
     //
-    // NOTE — scaling ceiling: Supabase's free-tier Edge Functions have a
-    // hard 150s wall-clock limit per run. Between the 20s user stagger AND
-    // the sequential subreddit fetch (up to 6 subreddits x 1.5s pause =
-    // ~9s added per user), the realistic ceiling is now closer to 4-5
-    // users before delays alone exceed the budget (before counting actual
-    // fetch/score time on top). If you grow past that, this loop will
-    // need to move to smaller batches (e.g. a separate invocation per
-    // user, or per few users) instead of one single run looping through
-    // everyone.
+    // NOTE — this stagger is now safe from Supabase's 150s ceiling
+    // regardless of total user count, since batching (above) caps each
+    // invocation to BATCH_SIZE users no matter how many exist overall.
+    // Within a single batch of 3, worst case is roughly: 3 x (20s stagger
+    // + ~9s sequential subreddit fetch + fetch/score time) — comfortably
+    // under 150s. If BATCH_SIZE itself needs to grow later, re-check this
+    // math against the actual per-user time before raising it.
     const STAGGER_MS = 20000
     let isFirstScoredUser = true
 
-    for (const profile of profiles) {
+    for (const profile of batch) {
       const userId = profile.user_id
+
+      // Stamp immediately, before any work — so if this profile throws
+      // partway through, it doesn't get retried infinitely within the
+      // same hour's batches. Worst case: it's skipped until next hour,
+      // not stuck in a crash loop eating every batch slot.
+      await supabase
+        .from('product_profiles')
+        .update({ last_cron_attempt_at: new Date().toISOString() })
+        .eq('user_id', userId)
 
       const { data: planRow } = await supabase
         .from('user_plans')
@@ -247,32 +353,10 @@ Deno.serve(async (req) => {
         const posts = await fetchSubreddit(sub)
         postArrays.push(posts)
 
-        // Dead-subreddit detection — track consecutive 0-post runs per
-        // user+subreddit. Surfaces renamed/banned/dead subreddits (like
-        // the producthunt case) automatically, instead of only catching
-        // it when a user notices missing leads and manually investigates.
-        if (posts.length === 0) {
-          const { data: healthRow } = await supabase
-            .from('subreddit_health')
-            .select('consecutive_zero_runs')
-            .eq('user_id', userId)
-            .eq('subreddit', sub)
-            .single()
-          const newStreak = (healthRow?.consecutive_zero_runs || 0) + 1
-          await supabase.from('subreddit_health').upsert(
-            { user_id: userId, subreddit: sub, consecutive_zero_runs: newStreak, last_checked_at: new Date().toISOString() },
-            { onConflict: 'user_id,subreddit' }
-          )
-          if (newStreak >= 3) {
-            console.log(`[cron-scan] WARNING: r/${sub} has returned 0 posts for ${newStreak} consecutive runs (user ${userId}) — likely dead, renamed, or banned subreddit`)
-          }
-        } else {
-          // Returned posts — reset the streak.
-          await supabase.from('subreddit_health').upsert(
-            { user_id: userId, subreddit: sub, consecutive_zero_runs: 0, last_checked_at: new Date().toISOString() },
-            { onConflict: 'user_id,subreddit' }
-          )
-        }
+        // Auto-detect this subreddit's no-pitch rules, cached for 30 days
+        // so we're not re-fetching rules on every single run. reply.js
+        // reads the result from subreddit_rules when drafting a reply.
+        await checkSubredditRules(sub)
 
         if (i < subreddits.length - 1) {
           await new Promise(r => setTimeout(r, FETCH_PAUSE_MS))
@@ -394,11 +478,31 @@ Deno.serve(async (req) => {
 
     console.log(`[cron-scan] run complete: ${processedCount} processed, ${skippedCount} skipped (quota)`)
 
+    // If more users still need processing this hour, schedule a one-time
+    // follow-up batch ~2 minutes from now. Reuses the same job name every
+    // time (schedule_followup_batch upserts it), so this naturally
+    // replaces itself each call rather than piling up duplicate jobs —
+    // no separate cleanup step needed.
+    if (remainingAfterThisBatch > 0) {
+      const nextRunAt = new Date(Date.now() + 2 * 60 * 1000)
+      console.log(`[cron-scan] ${remainingAfterThisBatch} users remain this hour — scheduling follow-up batch at ${nextRunAt.toISOString()}`)
+      const { error: scheduleErr } = await supabase.rpc('schedule_followup_batch', {
+        target_url: `${SUPABASE_URL}/functions/v1/cron-scan`,
+        auth_header: `Bearer ${SERVICE_ROLE_KEY}`,
+        run_at: nextRunAt.toISOString(),
+      })
+      if (scheduleErr) console.log('[cron-scan] failed to schedule follow-up batch:', scheduleErr.message)
+    } else {
+      console.log('[cron-scan] no users remaining this hour — done until next hourly trigger')
+    }
+
     return new Response(
       JSON.stringify({
         processed: processedCount,
         skipped: skippedCount,
         total: profiles.length,
+        batchSize: batch.length,
+        remainingThisHour: remainingAfterThisBatch,
         noPostsFetched: noPostsCount,
         noQualifyingLeads: noLeadsCount,
         allLeadsAlreadySeen: allSeenCount,
