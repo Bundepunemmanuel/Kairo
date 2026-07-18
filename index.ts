@@ -474,6 +474,22 @@ Deno.serve(async (req) => {
 
       console.log(`[cron-scan] user ${userId} (${plan}): added ${newLeads.length} new leads (${leadsToday + newLeads.length}/${limit} today)`)
       processedCount++
+
+      // Fire-and-forget push notification — one per new lead, per user's
+      // choice ("every new lead, no matter the score"). Never let a push
+      // failure affect the scan result itself; log and move on.
+      try {
+        const pushRes = await fetch(`${NEXTJS_BASE_URL}/api/send-push`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, leads: newLeads }),
+          signal: AbortSignal.timeout(15000),
+        })
+        const pushData = await pushRes.json()
+        if (pushData.sent) console.log(`[cron-scan] user ${userId}: sent ${pushData.sent} push notification(s)`)
+      } catch (e) {
+        console.log(`[cron-scan] user ${userId}: push notification error (non-fatal):`, e.message)
+      }
     }
 
     console.log(`[cron-scan] run complete: ${processedCount} processed, ${skippedCount} skipped (quota)`)
