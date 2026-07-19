@@ -64,7 +64,7 @@ Open http://localhost:3000
 ## How The Scan Pipeline Works
 
 ```
-User pastes URL
+User pastes url
       ↓
 Check localStorage — already scanned? → Show gate
       ↓
