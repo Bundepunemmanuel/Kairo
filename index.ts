@@ -164,6 +164,13 @@ async function checkSubredditRules(sub: string) {
     const rulesText = (data.rulesText || '').toLowerCase()
     const noPitch = NO_PITCH_PHRASES.some(phrase => rulesText.includes(phrase))
 
+    // Real evidence instead of a silent guess — if rulesText comes back
+    // empty or suspiciously short, this tells us exactly which upstream
+    // call failed (and how) rather than defaulting to no_pitch: false
+    // with no way to tell if that's because the subreddit genuinely has
+    // no restrictions, or because the fetch itself was blocked.
+    console.log(`[cron-scan] r/${sub} rules check: rulesStatus=${data.rulesStatus}, aboutStatus=${data.aboutStatus}, textLength=${rulesText.length}${data.errorMessage ? ', error=' + data.errorMessage : ''}`)
+
     await supabase.from('subreddit_rules').upsert(
       {
         subreddit: sub.toLowerCase(),
