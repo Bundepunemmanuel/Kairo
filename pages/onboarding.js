@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import Head from 'next/head'
-
-const GOOGLE_FORM = 'https://docs.google.com/forms/d/e/1FAIpQLSfRHyC7A3nteravGbpNqWtk7kroOkY2hrMGVM9_6T-cO7RumA/viewform?usp=dialog'
+import { useRouter } from 'next/router'
+import { supabase } from '../lib/supabase'
+import { useAuth } from './_app'
 
 const LOADING_STATES = [
   'Reading your product...',
@@ -87,8 +88,11 @@ async function fetchCommentsFromBrowser(subreddit, postId) {
 // ─── Component ────────────────────────────────────────────────────────────
 
 export default function Onboarding() {
+  const { user, loading: authLoading } = useAuth()
+  const router = useRouter()
   const [url, setUrl] = useState('')
   const [stage, setStage] = useState('input')
+  const [checkingExisting, setCheckingExisting] = useState(true)
   const [loadingIndex, setLoadingIndex] = useState(0)
   const [loadingMessage, setLoadingMessage] = useState(LOADING_STATES[0])
   const [leads, setLeads] = useState([])
@@ -100,6 +104,33 @@ export default function Onboarding() {
   const [scanStats, setScanStats] = useState(null) // { postsScanned, subreddits }
   const [replies, setReplies] = useState({}) // { [leadId]: reply text }
   const [replyLoading, setReplyLoading] = useState({}) // { [leadId]: true/false }
+
+  // If a logged-in user already has a saved product profile, send them straight
+  // to the dashboard instead of showing the anonymous-visitor marketing funnel.
+  // A logged-in user with NO saved profile yet still sees onboarding normally —
+  // this is how they scan for the first time after signing up.
+  useEffect(() => {
+    if (authLoading) return
+    if (!user) { setCheckingExisting(false); return }
+
+    const checkExistingProfile = async () => {
+      try {
+        const { data } = await supabase
+          .from('product_profiles')
+          .select('id')
+          .eq('user_id', user.id)
+          .single()
+        if (data) {
+          router.replace('/dashboard')
+          return
+        }
+      } catch {
+        // No profile found — fine, let them onboard normally
+      }
+      setCheckingExisting(false)
+    }
+    checkExistingProfile()
+  }, [user, authLoading, router])
 
   useEffect(() => {
     if (stage !== 'loading') return
@@ -151,7 +182,11 @@ export default function Onboarding() {
     const clean = url.startsWith('http') ? url : `https://${url}`
     if (!isValidUrl(clean)) { setError('Please enter a valid URL'); return }
 
-    if (localStorage.getItem('kairo_scan_used')) { setStage('gate'); return }
+    // The one-free-scan gate is for anonymous marketing visitors only.
+    // Logged-in users (e.g. right after signup) should always be able to
+    // scan — their actual usage is governed by their plan's daily quota,
+    // enforced separately by cron-scan.
+    if (!user && localStorage.getItem('kairo_scan_used')) { setStage('gate'); return }
 
     try {
       const r = await fetch('/api/check-ip', { signal: AbortSignal.timeout(5000) })
@@ -234,6 +269,43 @@ export default function Onboarding() {
       localStorage.setItem('kairo_scan_used', '1')
       setLeads(scoredLeads || [])
       setStage('results')
+
+      // Save product profile and leads to database if user is logged in
+      if (user) {
+        try {
+          // Save product profile
+          await supabase.from('product_profiles').upsert({
+            user_id: user.id,
+            url: clean,
+            analysis: productAnalysis,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'user_id' })
+
+          // Save leads
+          if (scoredLeads && scoredLeads.length > 0) {
+            // Delete old leads first
+            await supabase.from('leads').delete().eq('user_id', user.id)
+            // Insert new leads
+            const leadsToSave = scoredLeads.map(lead => ({
+              user_id: user.id,
+              post_id: lead.id || lead.url,
+              title: lead.title,
+              body: lead.body || '',
+              url: lead.url,
+              subreddit: lead.subreddit,
+              score: lead.score,
+              signal_type: lead.signalType,
+              specific_problem: lead.specificProblem || '',
+              reason: lead.reason || '',
+              created_at_post: lead.createdAt || Date.now(),
+            }))
+            await supabase.from('leads').insert(leadsToSave)
+          }
+        } catch (e) {
+          console.log('[onboarding] save error:', e.message)
+          // Non-fatal — scan still worked
+        }
+      }
     } catch (e) {
       setError(e.message || 'Something went wrong. Please try again.')
       setStage('input')
@@ -277,6 +349,16 @@ export default function Onboarding() {
     setTimeout(() => setCopiedId(null), 2000)
   }
 
+  // Avoid flashing the marketing funnel while we check if a logged-in user
+  // already has a saved profile and should be redirected to /dashboard instead.
+  if (checkingExisting) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: 'var(--cream)' }}>
+        <p style={{ color: 'var(--ink-light)', fontFamily: 'DM Sans, sans-serif' }}>Loading...</p>
+      </div>
+    )
+  }
+
   return (
     <>
       <Head>
@@ -293,7 +375,22 @@ export default function Onboarding() {
             <KairoLogo size={22} />
             <span style={{ fontFamily: 'var(--font-display)', fontSize: '1.15rem', fontWeight: 700, color: 'var(--ink)' }}>Kairo</span>
           </Link>
-          <a href={GOOGLE_FORM} target="_blank" rel="noopener noreferrer" style={{ fontSize: '0.88rem', fontWeight: 500, color: 'var(--rust)' }}>Join Kairo</a>
+          {user ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <Link href="/dashboard" style={{ fontSize: '0.88rem', fontWeight: 500, color: 'var(--rust)', textDecoration: 'none' }}>Dashboard</Link>
+              <button
+                onClick={async () => { await supabase.auth.signOut(); window.location.href = '/' }}
+                style={{ fontSize: '0.82rem', color: 'var(--ink-light)', background: 'none', border: 'none', cursor: 'pointer' }}
+              >
+                Sign out
+              </button>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <Link href="/login" style={{ fontSize: '0.88rem', fontWeight: 500, color: 'var(--ink-light)', textDecoration: 'none' }}>Login</Link>
+              <Link href="/signup" style={{ fontSize: '0.88rem', fontWeight: 600, color: 'var(--rust)', textDecoration: 'none' }}>Sign up</Link>
+            </div>
+          )}
         </nav>
 
         {/* ── INPUT ── */}
@@ -401,7 +498,7 @@ export default function Onboarding() {
                   </p>
                 </div>
                 {leads.length > 0 && (
-                  <div className="free-tag">3 free · <a href={GOOGLE_FORM} target="_blank" rel="noopener noreferrer" className="upgrade-link">Get more</a></div>
+                  <div className="free-tag">3 free · <Link href="/signup" className="upgrade-link">Sign up for more</Link></div>
                 )}
               </div>
 
@@ -417,9 +514,9 @@ export default function Onboarding() {
                     This is a good thing — you're not wasting time on weak matches. Try again in 15–30 minutes as new posts arrive.
                   </p>
                   <div className="no-leads-actions">
-                    <a href={GOOGLE_FORM} target="_blank" rel="noopener noreferrer" className="ob-scan-btn" style={{ textDecoration: 'none', display: 'inline-block', textAlign: 'center' }}>
-                      Get notified when leads appear →
-                    </a>
+                    <Link href="/signup" className="ob-scan-btn" style={{ textDecoration: 'none', display: 'inline-block', textAlign: 'center' }}>
+                      Sign up to get notified when leads appear →
+                    </Link>
                   </div>
                 </div>
               )}
@@ -481,26 +578,29 @@ export default function Onboarding() {
                     </div>
 
                     {isOpen && (
-                      <div className="reply-gate-box">
-                        <div className="reply-gate-icon">✍️</div>
-                        <p className="reply-gate-headline">Your reply is ready</p>
-                        <p className="reply-gate-sub">
-                          Kairo drafts a personalized reply for every lead — written to match their exact situation. Join the waitlist to unlock it.
-                        </p>
-                        <a
-                          href={GOOGLE_FORM}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="reply-gate-btn"
-                        >
-                          Join Kairo to get your reply →
-                        </a>
-                        <p className="reply-gate-note">Free · Launching August 13th · No credit card</p>
+                      <div className="draft-box">
+                        <div className="draft-header">
+                          <span className="draft-label">✍️ Draft Reply</span>
+                          {replies[lead.id] && (
+                            <button className="copy-btn" onClick={() => handleCopy(lead.id, replies[lead.id])}>
+                              {copiedId === lead.id ? 'Copied!' : 'Copy'}
+                            </button>
+                          )}
+                        </div>
+                        {replyLoading[lead.id] ? (
+                          <p className="draft-text" style={{ opacity: 0.6, fontStyle: 'italic' }}>Writing reply...</p>
+                        ) : replies[lead.id] ? (
+                          <p className="draft-text">{replies[lead.id]}</p>
+                        ) : (
+                          <p className="draft-text" style={{ opacity: 0.55, fontStyle: 'italic' }}>
+                            Could not generate a reply. Open the thread and reply manually using the problem context above.
+                          </p>
+                        )}
                       </div>
                     )}
 
                     <div className="lead-actions">
-                      <button className="lead-btn-primary" onClick={() => setExpandedLead(isOpen ? null : lead.id)}>
+                      <button className="lead-btn-primary" onClick={() => handleViewReply(lead.id, lead)}>
                         {isOpen ? 'Hide Reply' : '✍️ View Draft Reply'}
                       </button>
                       <a href={lead.url} target="_blank" rel="noopener noreferrer" className="lead-btn-secondary">
@@ -511,25 +611,23 @@ export default function Onboarding() {
                 )
               })}
 
-              {/* Join CTA — only show if there were leads */}
+              {/* Sign up CTA — only show if there were leads */}
               {leads.length > 0 && (
                 <div className="email-gate">
                   <div className="email-gate-inner">
                     <div className="email-gate-icon">🚀</div>
                     <h3 className="email-gate-headline">Want leads like these every day?</h3>
                     <p className="email-gate-sub">
-                      Kairo scans Reddit every 15 minutes and finds critical leads automatically — while you focus on building.
+                      Kairo scans Reddit automatically and finds critical leads while you focus on building.
                     </p>
-                    <a
-                      href={GOOGLE_FORM}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <Link
+                      href="/signup"
                       className="ob-scan-btn"
                       style={{ textAlign: 'center', textDecoration: 'none', display: 'block', marginTop: 4 }}
                     >
-                      Join Kairo — Free →
-                    </a>
-                    <p className="email-gate-note">No credit card · Launching August 13th</p>
+                      Sign up — Free →
+                    </Link>
+                    <p className="email-gate-note">No credit card required</p>
                   </div>
                 </div>
               )}
@@ -543,9 +641,9 @@ export default function Onboarding() {
             <div className="ob-gate-content">
               <div className="gate-icon">🔒</div>
               <h2 className="gate-headline">You've used your free scan</h2>
-              <p className="gate-sub">Join Kairo free to scan again and get leads daily.</p>
+              <p className="gate-sub">Sign up free to scan again and get leads automatically every day.</p>
               <div className="gate-actions">
-                <a href={GOOGLE_FORM} target="_blank" rel="noopener noreferrer" className="btn-primary">Join Kairo →</a>
+                <Link href="/signup" className="btn-primary">Sign up — Free →</Link>
                 <button className="gate-back" onClick={() => { setStage('input'); setUrl('') }}>← Back</button>
               </div>
             </div>
@@ -557,12 +655,5 @@ export default function Onboarding() {
 }
 
 function KairoLogo({ size = 24 }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 100 100" fill="none">
-      <rect x="10" y="38" width="45" height="10" rx="5" fill="#c0584a" opacity="0.6" />
-      <rect x="20" y="52" width="45" height="10" rx="5" fill="#c0584a" opacity="0.8" />
-      <rect x="15" y="66" width="45" height="10" rx="5" fill="#c0584a" opacity="0.7" />
-      <circle cx="76" cy="57" r="18" fill="#c0584a" />
-    </svg>
-  )
+  return <img src="/logo.png" alt="Kairo" width={size} height={size} style={{ objectFit: 'contain' }} />
 }

@@ -2,6 +2,83 @@
 
 //analyze.js — Product analysis: extracts precise ICP and specific problems for any product
 
+// Cerebras (primary) → Groq (fallback) → Nemotron via OpenRouter (final fallback, no retry)
+export const config = { maxDuration: 60 }
+
+async function cerebras(messages, maxTokens, temperature, _isRetry = false) {
+  try {
+    const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}` },
+      body: JSON.stringify({ model: 'gpt-oss-120b', messages, max_tokens: maxTokens, temperature, reasoning_effort: 'low' }),
+    })
+
+    if (res.status === 429 && !_isRetry) {
+      const resetSeconds = parseFloat(res.headers.get('x-ratelimit-reset-tokens-minute') || '')
+      const waitSeconds = Number.isFinite(resetSeconds) ? Math.ceil(resetSeconds) + 1 : 15
+      console.log(`[analyze:cerebras] rate limited — retrying in ${waitSeconds}s`)
+      await new Promise(r => setTimeout(r, waitSeconds * 1000))
+      return cerebras(messages, maxTokens, temperature, true)
+    }
+
+    const data = await res.json()
+    console.log('[analyze:cerebras] full response:', JSON.stringify(data).slice(0, 500))
+    if (data.error) { console.log('[analyze:cerebras] error:', data.error.message); return '' }
+    const content = data.choices?.[0]?.message?.content || ''
+
+    // Cerebras sometimes returns 200 with genuinely blank content — not an
+    // error, just nothing. Retry once before giving up on it, since this
+    // often looks transient rather than a real rejection.
+    if (!content && !_isRetry) {
+      console.log('[analyze:cerebras] empty content on success response — retrying once')
+      await new Promise(r => setTimeout(r, 3000))
+      return cerebras(messages, maxTokens, temperature, true)
+    }
+    return content
+  } catch (e) {
+    console.log('[analyze:cerebras] fetch error:', e.message)
+    return ''
+  }
+}
+
+async function groq(messages, maxTokens, temperature, model = 'openai/gpt-oss-120b') {
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature, reasoning_effort: 'low' }),
+    })
+    const data = await res.json()
+    console.log('[analyze:groq] status:', res.status, '| error:', data.error?.message || 'none')
+    if (data.error) return ''
+    return data.choices?.[0]?.message?.content || ''
+  } catch (e) {
+    console.log('[analyze:groq] fetch error:', e.message)
+    return ''
+  }
+}
+
+// Final fallback only — no retry, strips reasoning trace (Nemotron doesn't
+// use <think> tags, so the whole raw response is often reasoning prose —
+// heuristic below detects and discards that case).
+async function nemotron(messages, maxTokens, temperature) {
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
+      body: JSON.stringify({ model: 'nvidia/nemotron-3-ultra-550b-a55b:free', messages, max_tokens: maxTokens, temperature }),
+    })
+    const data = await res.json()
+    if (data.error) { console.log('[analyze:nemotron] error:', data.error.message); return '' }
+    let content = data.choices?.[0]?.message?.content || ''
+    content = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+    return content
+  } catch (e) {
+    console.log('[analyze:nemotron] fetch error:', e.message)
+    return ''
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
@@ -66,22 +143,14 @@ export default async function handler(req, res) {
   }
 
   try {
-    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+    const messages = [
+      {
+        role: 'system',
+        content: 'You are a product analyst. Return only raw JSON. No markdown. No code blocks. No text before or after the JSON.',
       },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a product analyst. Return only raw JSON. No markdown. No code blocks. No text before or after the JSON.',
-          },
-          {
-            role: 'user',
-            content: `Analyze this product and return a JSON object with these exact fields.
+      {
+        role: 'user',
+        content: `Analyze this product and return a JSON object with these exact fields.
 
 CRITICAL RULE FOR EVERY FIELD: Be specific to THIS product. Do not use generic startup language. Think about what the actual user of this product is doing when they hit the problem.
 
@@ -197,18 +266,22 @@ Website content: ${content.slice(0, 6000)}
 ${content.length < 200 ? 'IMPORTANT: Website content is empty because this site uses JavaScript rendering. Use your training knowledge about this product based on the URL. Products like Notion, Linear, Stripe, Zapier, Cal.com, Resend are in your training data. Use that knowledge now to fill all fields accurately and specifically.' : 'Analyze the product from the content above.'}
 
 Return only the JSON object.`,
-          },
-        ],
-        max_tokens: 1600,
-        temperature: 0.2,
-      }),
-    })
+      },
+    ]
 
-    const data = await groqRes.json()
-    console.log('[analyze] groq status:', groqRes.status)
-    console.log('[analyze] groq error:', data.error?.message || 'none')
+    console.log('[analyze] trying Cerebras (primary)')
+    let raw = await cerebras(messages, 1600, 0.2)
 
-    const raw = data.choices?.[0]?.message?.content || ''
+    if (!raw) {
+      console.log('[analyze] Cerebras empty — falling back to Groq')
+      raw = await groq(messages, 1600, 0.2)
+    }
+
+    if (!raw) {
+      console.log('[analyze] Groq empty — falling back to Nemotron (final)')
+      raw = await nemotron(messages, 2500, 0.2)
+    }
+
     console.log('[analyze] raw length:', raw.length, '| preview:', raw.slice(0, 300))
 
     let analysis = null
@@ -226,10 +299,12 @@ Return only the JSON object.`,
       }
     }
 
+    let isFallback = false
     if (!analysis) {
-      console.log('[analyze] groq returned empty — using fallback')
+      console.log('[analyze] all 3 models failed — using generic fallback')
       const domain = url.replace(/https?:\/\//, '').split('/')[0].replace('www.', '')
       analysis = buildFallback(domain)
+      isFallback = true
     }
 
     analysis = sanitize(analysis, url)
@@ -238,12 +313,15 @@ Return only the JSON object.`,
     console.log('[analyze] specificProblems[0]:', analysis.specificProblems?.[0])
     console.log('[analyze] subreddits:', analysis.subreddits?.join(', '))
 
-    return res.status(200).json({ analysis })
+    // isFallback tells callers (e.g. cron-scan's weekly re-analyze) that
+    // this is a generic placeholder, not a real analysis — so they can
+    // skip overwriting a perfectly good existing analysis with it.
+    return res.status(200).json({ analysis, isFallback })
 
   } catch (err) {
     console.error('[analyze] fatal:', err.message)
     const domain = url.replace(/https?:\/\//, '').split('/')[0].replace('www.', '')
-    return res.status(200).json({ analysis: buildFallback(domain) })
+    return res.status(200).json({ analysis: buildFallback(domain), isFallback: true })
   }
 }
 

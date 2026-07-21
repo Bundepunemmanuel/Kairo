@@ -1,4 +1,4 @@
-# Kairo — Customer Acquisition Platform for Solo Founders
+# Kairo — Customer Acquisition Platform for Solo Founders.
 
 Kairo automatically finds people on Reddit who are ready to buy products like yours.
 Paste your URL → Kairo reads your product → finds live Reddit posts with buying intent → scores them → drafts your reply → shows a decay timer
@@ -64,7 +64,7 @@ Open http://localhost:3000
 ## How The Scan Pipeline Works
 
 ```
-User pastes URL
+User pastes url
       ↓
 Check localStorage — already scanned? → Show gate
       ↓

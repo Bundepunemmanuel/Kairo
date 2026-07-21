@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import Link from 'next/link'
 import Head from 'next/head'
+import { supabase } from '../lib/supabase'
+import { useAuth } from './_app'
 
 const STATS = [
   { value: '2 min', label: 'To your first lead' },
@@ -44,6 +46,7 @@ const PRICING = [
 ]
 
 export default function Home() {
+  const { user } = useAuth()
   const [scrolled, setScrolled] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
   const sectionsRef = useRef([])
@@ -75,7 +78,7 @@ export default function Home() {
       <div className="announcement">
         <span>🔴 Try the live demo free</span>
         <span style={{ opacity: 0.4 }}>·</span>
-        <span>Join the waitlist for full access.</span>
+        <span>Sign up free to scan automatically every day.</span>
       </div>
 
       {/* Nav */}
@@ -89,7 +92,23 @@ export default function Home() {
             <a href="#how-it-works" className="nav-link">How It Works</a>
             <a href="#pricing" className="nav-link">Pricing</a>
             <a href="https://subscan-omega.vercel.app" target="_blank" rel="noopener noreferrer" className="nav-link">SubScan</a>
-            <Link href="/onboarding" className="nav-cta">Try Kairo Free</Link>
+            {user ? (
+              <>
+                <Link href="/dashboard" className="nav-link">Dashboard</Link>
+                <button
+                  onClick={async () => { await supabase.auth.signOut() }}
+                  className="nav-link"
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
+                >
+                  Sign out
+                </button>
+              </>
+            ) : (
+              <>
+                <Link href="/login" className="nav-link">Login</Link>
+                <Link href="/signup" className="nav-cta">Sign up free</Link>
+              </>
+            )}
           </div>
           <button className="menu-toggle" onClick={() => setMenuOpen(!menuOpen)} aria-label="Menu">
             <span className="menu-bar" style={menuOpen ? { transform: 'rotate(45deg) translate(5px,5px)' } : {}} />
@@ -323,13 +342,6 @@ export default function Home() {
   )
 }
 
-function KairoLogo({ size = 26 }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 100 100" fill="none">
-      <rect x="10" y="38" width="45" height="10" rx="5" fill="#c0584a" opacity="0.6" />
-      <rect x="20" y="52" width="45" height="10" rx="5" fill="#c0584a" opacity="0.8" />
-      <rect x="15" y="66" width="45" height="10" rx="5" fill="#c0584a" opacity="0.7" />
-      <circle cx="76" cy="57" r="18" fill="#c0584a" />
-    </svg>
-  )
+function KairoLogo({ size = 24 }) {
+  return <img src="/logo.png" alt="Kairo" width={size} height={size} style={{ objectFit: 'contain' }} />
 }

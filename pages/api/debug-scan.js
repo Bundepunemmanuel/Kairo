@@ -9,7 +9,7 @@ async function callGroq(messages, maxTokens = 1000, temperature = 0.3) {
       Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-120b',
       messages,
       max_tokens: maxTokens,
       temperature,

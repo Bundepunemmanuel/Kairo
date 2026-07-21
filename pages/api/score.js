@@ -1,16 +1,42 @@
 // score.js — Simple, robust, no silent failures
-// Groq llama-3.3-70b → scoring
-// Groq qwen-qwq-32b → replies (Cerebras fallback if rate limited)
+// Scoring: Cerebras gpt-oss-120b (primary, 1M tokens/day) → Groq openai/gpt-oss-120b (fallback) → Nemotron 3 Ultra via OpenRouter free tier (final fallback, no retry)
 
-async function groq(messages, maxTokens, temperature, model = 'llama-3.3-70b-versatile') {
+// Vercel Hobby's default timeout (5-10s) isn't enough room for the
+// rate-limit retry wait below (up to ~30s). Hobby allows configuring
+// maxDuration up to 60s explicitly — without this, a retry would get
+// killed by Vercel mid-wait and return a 504 instead of completing.
+export const config = { maxDuration: 60 }
+
+function parseRetryAfterSeconds(message) {
+  // Groq's TPM error looks like: "...Please try again in 30.1725s."
+  const match = (message || '').match(/try again in ([\d.]+)s/i)
+  return match ? Math.ceil(parseFloat(match[1])) : null
+}
+
+async function groq(messages, maxTokens, temperature, model = 'openai/gpt-oss-120b', _isRetry = false) {
   try {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature }),
+      body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature, reasoning_effort: 'low' }),
     })
     const data = await res.json()
-    if (data.error) { console.log(`[groq:${model}] error:`, data.error.message); return '' }
+    if (data.error) {
+      console.log(`[groq:${model}] error:`, data.error.message)
+
+      // Rate limit hit (TPM/RPM ceiling) — this is transient, not a real
+      // "no content" failure. Wait the time Groq tells us and retry once,
+      // instead of silently treating it as zero qualifying leads.
+      const isRateLimit = res.status === 429 || /rate.?limit/i.test(data.error.message || '')
+      if (isRateLimit && !_isRetry) {
+        const waitSeconds = parseRetryAfterSeconds(data.error.message) || 15
+        console.log(`[groq:${model}] rate limited — retrying in ${waitSeconds}s`)
+        await new Promise(r => setTimeout(r, waitSeconds * 1000))
+        return groq(messages, maxTokens, temperature, model, true)
+      }
+
+      return ''
+    }
     return data.choices?.[0]?.message?.content || ''
   } catch (e) {
     console.log(`[groq:${model}] fetch error:`, e.message)
@@ -18,16 +44,64 @@ async function groq(messages, maxTokens, temperature, model = 'llama-3.3-70b-ver
   }
 }
 
-async function cerebras(messages, maxTokens, temperature) {
+// Third fallback only — no retry logic. By the time both Cerebras and
+// Groq have failed, burning more time on a retry risks the function
+// timeout. Single best-effort attempt, fail-empty if it doesn't work.
+async function nemotron(messages, maxTokens, temperature) {
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
+      body: JSON.stringify({
+        model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+        messages,
+        max_tokens: maxTokens,
+        temperature,
+      }),
+    })
+    const data = await res.json()
+    if (data.error) { console.log('[nemotron] error:', data.error.message); return '' }
+    let content = data.choices?.[0]?.message?.content || ''
+    // Reasoning models emit a <think>...</think> trace before the real
+    // answer — strip it so it doesn't break JSON parsing or leak into
+    // whatever the caller actually wants (scoring JSON / reply text).
+    content = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+    return content
+  } catch (e) {
+    console.log('[nemotron] fetch error:', e.message)
+    return ''
+  }
+}
+
+async function cerebras(messages, maxTokens, temperature, _isRetry = false) {
   try {
     const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}` },
-      body: JSON.stringify({ model: 'llama-3.3-70b', messages, max_tokens: maxTokens, temperature }),
+      body: JSON.stringify({ model: 'gpt-oss-120b', messages, max_tokens: maxTokens, temperature, reasoning_effort: 'low' }),
     })
+
+    if (res.status === 429 && !_isRetry) {
+      // Cerebras reports reset time via headers, not error message text.
+      const resetSeconds = parseFloat(res.headers.get('x-ratelimit-reset-tokens-minute') || '')
+      const waitSeconds = Number.isFinite(resetSeconds) ? Math.ceil(resetSeconds) + 1 : 15
+      console.log(`[cerebras] rate limited — retrying in ${waitSeconds}s`)
+      await new Promise(r => setTimeout(r, waitSeconds * 1000))
+      return cerebras(messages, maxTokens, temperature, true)
+    }
+
     const data = await res.json()
     if (data.error) { console.log('[cerebras] error:', data.error.message); return '' }
-    return data.choices?.[0]?.message?.content || ''
+    const content = data.choices?.[0]?.message?.content || ''
+
+    // Cerebras sometimes returns 200 with genuinely blank content — not an
+    // error, just nothing. Retry once before falling through to Groq.
+    if (!content && !_isRetry) {
+      console.log('[cerebras] empty content on success response — retrying once')
+      await new Promise(r => setTimeout(r, 3000))
+      return cerebras(messages, maxTokens, temperature, true)
+    }
+    return content
   } catch (e) {
     console.log('[cerebras] fetch error:', e.message)
     return ''
@@ -50,10 +124,17 @@ function parseJSON(raw) {
 }
 
 // ─── Score all posts in one call (no batching complexity) ─────────────────
-// Takes up to 20 posts, returns array of { post, score, signalType, specificProblem, reason }
+// Takes up to 40 posts, returns { scored: [...], scoredUrls: [...] }
+// scoredUrls is every post actually sent to an AI — used by cron-scan to
+// mark them in seen_posts so they're never re-scored, whether they
+// qualified as a lead or not.
 async function scorePosts(posts, analysis) {
-  // Take first 20 posts — enough signal, avoids token limits
-  const sample = posts.slice(0, 20)
+  // Take first 40 posts — safely within budget for either provider.
+  // Posts arrive already round-robin'd across subreddits from cron-scan,
+  // so this sample is spread fairly rather than dominated by whichever
+  // subreddit was fetched first.
+  const sample = posts.slice(0, 40)
+  const scoredUrls = sample.map(p => p.url).filter(Boolean)
 
   const input = sample.map((p, i) => ({
     i,
@@ -62,7 +143,7 @@ async function scorePosts(posts, analysis) {
     sub: p.subreddit,
   }))
 
-  const raw = await groq([
+  const messages = [
     {
       role: 'system',
       content: 'Lead qualification engine. Return only a valid JSON array. No markdown. No explanation.',
@@ -102,16 +183,33 @@ Format: [{"i":0,"score":8,"type":"active","problem":"exact problem they have","w
 
 Posts: ${JSON.stringify(input)}`,
     },
-  ], 1500, 0.1)
+  ]
+
+  // Cerebras first — 1M tokens/day vs Groq's 200K for this workload, and
+  // scoring is by far the highest-volume call in the app (every cron run,
+  // every user). Groq is the fallback if Cerebras itself is rate limited
+  // or errors, not the other way around.
+  console.log('[score] trying Cerebras (primary)')
+  let raw = await cerebras(messages, 1500, 0.1)
+
+  if (!raw) {
+    console.log('[score] Cerebras empty — falling back to Groq')
+    raw = await groq(messages, 1500, 0.1)
+  }
+
+  if (!raw) {
+    console.log('[score] Groq empty — falling back to Nemotron (final)')
+    raw = await nemotron(messages, 2500, 0.1)
+  }
 
   console.log(`[score] raw (150): ${raw.slice(0, 150)}`)
 
   const scored = parseJSON(raw)
-  if (!scored) { console.log('[score] parse failed'); return [] }
+  if (!scored) { console.log('[score] parse failed'); return { scored: [], scoredUrls } }
 
-  console.log(`[score] groq returned ${scored.length} qualified`)
+  console.log(`[score] model returned ${scored.length} qualified`)
 
-  return scored
+  const results = scored
     .filter(s => s.score >= 7 && typeof s.i === 'number' && s.i >= 0 && s.i < sample.length)
     .map(s => {
       const post = sample[s.i]
@@ -125,6 +223,8 @@ Posts: ${JSON.stringify(input)}`,
       }
     })
     .filter(Boolean)
+
+  return { scored: results, scoredUrls }
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────
@@ -137,10 +237,10 @@ export default async function handler(req, res) {
   console.log(`[score] ${posts.length} posts | product: ${analysis.name}`)
 
   try {
-    const scored = await scorePosts(posts, analysis)
+    const { scored, scoredUrls } = await scorePosts(posts, analysis)
     console.log(`[score] qualified: ${scored.length}`)
 
-    if (!scored.length) return res.status(200).json({ leads: [] })
+    if (!scored.length) return res.status(200).json({ leads: [], scoredUrls })
 
     const top3 = scored.sort((a, b) => b.score - a.score).slice(0, 3)
     console.log('[score] top3:', top3.map(s => `"${s.post.title.slice(0, 35)}" (${s.score})`).join(' | '))
@@ -163,7 +263,7 @@ export default async function handler(req, res) {
     })
 
     console.log(`[score] returning ${leads.length} leads`)
-    return res.status(200).json({ leads })
+    return res.status(200).json({ leads, scoredUrls })
 
   } catch (err) {
     console.error('[score] fatal:', err.message)
