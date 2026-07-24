@@ -7,6 +7,23 @@
 // killed by Vercel mid-wait and return a 504 instead of completing.
 export const config = { maxDuration: 60 }
 
+// ─── Scoring weights ────────────────────────────────────────────────────
+// Final is computed here in code, not by the model, so it can be tuned
+// without touching the prompt. Problem and Intent are weighted higher
+// than ICP deliberately: someone with a real problem and real buying
+// intent is still a workable lead even at an imperfect ICP fit, but a
+// perfect-ICP post with no real problem or intent isn't a lead at all.
+// ICP modulates the score, it doesn't gate it.
+const WEIGHTS = { problem: 0.4, intent: 0.4, icp: 0.2 }
+
+// Starting point, not a final answer. The old single-score bar (score >= 7
+// out of 10, i.e. 70%) produced zero qualified leads across 25 posts, so
+// 70% is proven too strict for this prompt. 60 leaves real room below that
+// failed bar. Revisit after watching real Final-score distributions in the
+// logs below — if posts in the 50-60 range look like real leads on manual
+// read, lower it; if posts clearing 60 look weak, raise it.
+const QUALIFY_THRESHOLD = 60
+
 function parseRetryAfterSeconds(message) {
   // Groq's TPM error looks like: "...Please try again in 30.1725s."
   const match = (message || '').match(/try again in ([\d.]+)s/i)
@@ -150,7 +167,7 @@ async function scorePosts(posts, analysis) {
     },
     {
       role: 'user',
-      content: `Score these Reddit posts as leads for this product.
+      content: `Score EVERY one of these Reddit posts as a potential lead for this product. Return a score for all of them, even posts that clearly don't qualify — do not skip any, do not return [] to mean "nothing qualifies here."
 
 PRODUCT: ${analysis.name}
 WHAT IT DOES: ${analysis.description}
@@ -158,27 +175,27 @@ TARGET CUSTOMER: ${analysis.targetCustomer || ''}
 SPECIFIC PROBLEMS IT SOLVES: ${analysis.specificProblems?.slice(0, 5).join(' | ') || ''}
 COMPETITORS: ${analysis.competitors?.join(', ') || 'none'}
 
-SCORING:
-9-10: Person EXPLICITLY experiencing a specific problem this product solves, actively seeking solution
-7-8: Person clearly struggling with a problem this product solves
-0-6: Reject — do not include
+Score each post on THREE separate 0-100 scales:
 
-CRITICAL: The problem must be the MAIN TOPIC of the post — not mentioned in passing or as background context.
-If someone mentions a problem only as an example or side note while asking about something else — REJECT.
+PROBLEM (0-100): imagine highlighting every sentence in this post that's actually about one of the specific problems above. Is most of the post highlighted, or is there just one throwaway line buried in something unrelated?
+This is about substance, not phrasing — a post can score high whether the person is complaining, calmly reflecting, realizing something out loud, or telling a story, as long as the problem is genuinely what the post is about. Do NOT infer a generic need (e.g. "every founder needs users/growth/customers") onto a post just because they're a founder — that must actually be what THIS post is substantively about, not something true of founders in general.
+- 70-100: most of the post's substance is this problem — it's what the post is actually about, regardless of tone or whether they explicitly ask for help
+- 30-69: the problem appears, but it's one part of a post that's mostly about something else
+- 0-29: not present, or only a passing/incidental line while the post is fundamentally about something unrelated (e.g. a launch announcement, an unrelated question, a milestone post)
 
-ALWAYS REJECT:
-- Posts that are SHARING not ASKING (announcements, launches, success stories, tips, advice, AMAs)
-- Wrong business type for this product
-- Person already banned/rejected by this product or its competitors
-- General discussion, opinions, news with no personal problem
-- Networking posts (finding connections, referrals, relationships)
-- Beginner asking how to start with no existing product
-- Platform-specific pain this product doesn't solve
+ICP (0-100): how well the poster matches the target customer described above.
+- 80-100: clearly matches the target customer
+- 40-79: plausible fit, not explicit
+- 0-39: wrong business type / audience for this product
 
-Only include posts scoring 7+.
-Return [] if nothing qualifies.
+INTENT (0-100): how actively they're seeking a solution right now.
+- 80-100: actively asking for a solution/recommendation now
+- 40-79: has the pain, not actively shopping (passive)
+- 0-39: no real intent signal — sharing, announcing, general discussion, networking, or asking how to start with no existing product
 
-Format: [{"i":0,"score":8,"type":"active","problem":"exact problem they have","why":"one sentence from their words"}]
+Do not let one dimension bleed into another — e.g. a post can have a real Problem but low Intent if they're just venting, not asking.
+
+Format: [{"i":0,"problem":72,"icp":65,"intent":88,"type":"active","problem_text":"exact problem they have","why":"one sentence from their words"}]
 "type" is "active" (seeking solution now) or "passive" (has pain, not shopping)
 
 Posts: ${JSON.stringify(input)}`,
@@ -207,22 +224,55 @@ Posts: ${JSON.stringify(input)}`,
   const scored = parseJSON(raw)
   if (!scored) { console.log('[score] parse failed'); return { scored: [], scoredUrls } }
 
-  console.log(`[score] model returned ${scored.length} qualified`)
+  console.log(`[score] model returned ${scored.length} posts scored`)
 
-  const results = scored
-    .filter(s => s.score >= 7 && typeof s.i === 'number' && s.i >= 0 && s.i < sample.length)
+  const allResults = scored
+    .filter(s => typeof s.i === 'number' && s.i >= 0 && s.i < sample.length)
     .map(s => {
       const post = sample[s.i]
       if (!post) { console.log(`[score] post at index ${s.i} is undefined`); return null }
+
+      const problem = Number(s.problem) || 0
+      const icp = Number(s.icp) || 0
+      const intent = Number(s.intent) || 0
+
+      // Floor gate: if the problem barely appears in the post at all, no
+      // amount of ICP/Intent should be able to rescue it. Without this, a
+      // founder posting about literally anything in the right subreddit,
+      // phrased as a question, could clear threshold on ICP+Intent alone
+      // even with almost no real problem match — which is exactly the
+      // false-positive pattern seen in production (e.g. a payment-processor
+      // question scoring Problem 40 but still qualifying at Final 68).
+      const PROBLEM_FLOOR = 30
+      const final = problem < PROBLEM_FLOOR
+        ? problem
+        : Math.round(problem * WEIGHTS.problem + intent * WEIGHTS.intent + icp * WEIGHTS.icp)
+      const qualifies = final >= QUALIFY_THRESHOLD
+
+      // Log every post's breakdown, pass or fail — this is what the old
+      // code never gave us: visibility into *why* a post didn't qualify,
+      // not just a silent drop.
+      console.log(
+        `[score] "${(post.title || '').slice(0, 60)}" — ` +
+        `Problem: ${problem} | ICP: ${icp} | Intent: ${intent} | Final: ${final} — ` +
+        (qualifies ? 'Qualified' : `Rejected (threshold ${QUALIFY_THRESHOLD})`)
+      )
+
       return {
         post,
-        score: Number(s.score) || 5,
+        problem,
+        icp,
+        intent,
+        score: final, // kept as `score` downstream so cron-scan/leads consumers don't need to change
+        qualifies,
         signalType: s.type === 'active' ? 'active' : 'passive',
-        specificProblem: s.problem || '',
+        specificProblem: s.problem_text || '',
         reason: s.why || '',
       }
     })
     .filter(Boolean)
+
+  const results = allResults.filter(r => r.qualifies)
 
   return { scored: results, scoredUrls }
 }

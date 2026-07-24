@@ -40,10 +40,22 @@ export default async function handler(req, res) {
     let failed = 0
 
     for (const lead of leads) {
+      // specificProblem (e.g. "Looking for Mojo Auth alternatives") reads
+      // like a real signal summary, unlike the raw post title which is
+      // often noisy/clickbaity. Fall back to the title if it's missing.
+      const summary = lead.specificProblem || (lead.title || '').slice(0, 120)
+
       const payload = JSON.stringify({
-        title: `New lead: r/${lead.subreddit}`,
-        body: (lead.title || '').slice(0, 120),
-        url: '/dashboard',
+        title: '🔥 Fresh buying signal detected',
+        body: `r/${lead.subreddit} • ${summary}`,
+        // Absolute URL so the click-through always lands on the production
+        // domain regardless of which origin this subscription/SW was
+        // registered on. Note: this does NOT change the origin label Chrome
+        // shows above the notification itself (e.g. "kairo-git-chunk-6-...")
+        // — that's tied to where the push subscription was created, and can
+        // only be fixed by subscribing from https://kairo-omega.vercel.app
+        // directly, not from anything sent in this payload.
+        url: `https://kairo-omega.vercel.app/dashboard`,
         tag: `lead-${lead.id || lead.post_id || ''}`, // dedup near-simultaneous notifications for the same lead
       })
 
