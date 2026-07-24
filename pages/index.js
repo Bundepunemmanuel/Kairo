@@ -24,6 +24,11 @@ const OUTCOMES = [
   { icon: '🌍', title: 'Distribution on autopilot', desc: 'Wake up to customers already found. Your product gets seen by people actively looking for it — every single day.' },
 ]
 
+// Manual promo counter — update this by hand as spots fill (see admin.js
+// for actually granting/expiring the free month on a user's account; this
+// constant only controls what the landing page displays).
+const PROMO_SPOTS_LEFT = 10
+
 const PRICING = [
   {
     name: 'Starter', price: '$29', period: '/month',
@@ -36,6 +41,7 @@ const PRICING = [
     desc: 'For founders ready to scale',
     features: ['50 leads per day', '10 subreddits monitored', 'Everything in Starter', 'AI draft replies', 'Email alerts for critical leads'],
     highlight: true,
+    promo: true,
   },
   {
     name: 'Unlimited', price: '$99', period: '/month',
@@ -288,27 +294,43 @@ export default function Home() {
           <h2 className="section-headline">One customer pays for<br /><em>a year of Kairo</em></h2>
           <p className="section-sub">Start free. Upgrade when you're finding leads worth paying for.</p>
           <div className="pricing-grid">
-            {PRICING.map(p => (
-              <div key={p.name} className={`pricing-card${p.highlight ? ' pricing-card-highlight' : ''}`}>
-                {p.highlight && <div className="pricing-popular">Most Popular</div>}
-                <div className="pricing-name">{p.name}</div>
-                <div className="pricing-price">
-                  <span className="pricing-amount">{p.price}</span>
-                  <span className="pricing-period">{p.period}</span>
+            {PRICING.map(p => {
+              const promoActive = p.promo && PROMO_SPOTS_LEFT > 0
+              return (
+                <div key={p.name} className={`pricing-card${p.highlight ? ' pricing-card-highlight' : ''}`}>
+                  {promoActive ? (
+                    <div className="pricing-popular pricing-promo">🎁 Free your first month — {PROMO_SPOTS_LEFT} spots left</div>
+                  ) : (
+                    p.highlight && <div className="pricing-popular">Most Popular</div>
+                  )}
+                  <div className="pricing-name">{p.name}</div>
+                  <div className="pricing-price">
+                    {promoActive ? (
+                      <>
+                        <span className="pricing-amount">Free</span>
+                        <span className="pricing-period">for 1 month, then {p.price}{p.period}</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="pricing-amount">{p.price}</span>
+                        <span className="pricing-period">{p.period}</span>
+                      </>
+                    )}
+                  </div>
+                  <p className="pricing-desc">{p.desc}</p>
+                  <ul className="pricing-features">
+                    {p.features.map(f => (
+                      <li key={f} className="pricing-feature">
+                        <span className="pricing-check">✓</span>{f}
+                      </li>
+                    ))}
+                  </ul>
+                  <Link href="/onboarding" className={`pricing-cta${p.highlight ? ' pricing-cta-highlight' : ''}`}>
+                    Start Finding Leads
+                  </Link>
                 </div>
-                <p className="pricing-desc">{p.desc}</p>
-                <ul className="pricing-features">
-                  {p.features.map(f => (
-                    <li key={f} className="pricing-feature">
-                      <span className="pricing-check">✓</span>{f}
-                    </li>
-                  ))}
-                </ul>
-                <Link href="/onboarding" className={`pricing-cta${p.highlight ? ' pricing-cta-highlight' : ''}`}>
-                  Start Finding Leads
-                </Link>
-              </div>
-            ))}
+              )
+            })}
           </div>
           <p className="pricing-note">Start free · No credit card required · Upgrade anytime</p>
         </div>

@@ -22,6 +22,11 @@ export default function Dashboard() {
   const [openMenuId, setOpenMenuId] = useState(null)
   const [lastSeenAt, setLastSeenAt] = useState(null)
   const [neverScanned, setNeverScanned] = useState(false)
+  // Today/Older filter — leads were previously all sorted together by
+  // score/new-ness with no date grouping, so a 15-day-old lead could sit
+  // right next to a same-day one. Defaults to 'today' since that's the
+  // view people actually want on a daily check-in.
+  const [dateTab, setDateTab] = useState('today')
 
   // Reply state — per-lead, generated on demand via /api/reply (real feature, not a paywall)
   const [replies, setReplies] = useState({})
@@ -238,6 +243,18 @@ export default function Dashboard() {
 
   const isLeadNew = lead => lastSeenAt && new Date(lead.scanned_at).getTime() > new Date(lastSeenAt).getTime()
 
+  // "Today" = scanned on the current calendar day (local time), not "within
+  // the last 24 hours" — so the tab lines up with what someone means by
+  // "today" when they check in once a day, rather than a rolling window.
+  const isScannedToday = dateStr => {
+    const d = new Date(dateStr)
+    const now = new Date()
+    return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate()
+  }
+  const todayLeads = activeLeads.filter(l => isScannedToday(l.scanned_at))
+  const olderLeads = activeLeads.filter(l => !isScannedToday(l.scanned_at))
+  const visibleLeads = dateTab === 'today' ? todayLeads : olderLeads
+
   if (authLoading || loading) {
     return (
       <div className="dash-loading">
@@ -319,7 +336,7 @@ export default function Dashboard() {
 
               <div className="dash-leads-header">
                 <h2 className="dash-leads-title">
-                  {activeLeads.length > 0 ? `${activeLeads.length} active ${activeLeads.length === 1 ? 'lead' : 'leads'}` : 'No active leads'}
+                  {visibleLeads.length > 0 ? `${visibleLeads.length} active ${visibleLeads.length === 1 ? 'lead' : 'leads'}` : 'No active leads'}
                 </h2>
                 <p className="dash-leads-sub">
                   {activeLeads.length > 0
@@ -330,18 +347,37 @@ export default function Dashboard() {
                 </p>
               </div>
 
-              {activeLeads.length === 0 && (
+              <div className="dash-date-tabs">
+                <button
+                  type="button"
+                  className={`dash-date-tab${dateTab === 'today' ? ' active' : ''}`}
+                  onClick={() => setDateTab('today')}
+                >
+                  Today {todayLeads.length > 0 && `(${todayLeads.length})`}
+                </button>
+                <button
+                  type="button"
+                  className={`dash-date-tab${dateTab === 'older' ? ' active' : ''}`}
+                  onClick={() => setDateTab('older')}
+                >
+                  Older {olderLeads.length > 0 && `(${olderLeads.length})`}
+                </button>
+              </div>
+
+              {visibleLeads.length === 0 && (
                 <div className="dash-no-leads">
                   <div style={{ fontSize: '2rem', marginBottom: 12 }}>🔍</div>
                   <p>
-                    {quotaReached
-                      ? 'No more leads until your quota resets.'
-                      : 'No active leads right now. New ones will appear here automatically as Kairo scans.'}
+                    {dateTab === 'today'
+                      ? (quotaReached
+                          ? 'No more leads until your quota resets.'
+                          : 'No new leads today yet. Check the Older tab, or check back shortly as Kairo keeps scanning.')
+                      : 'No older leads — everything active right now arrived today.'}
                   </p>
                 </div>
               )}
 
-              {activeLeads.map((lead, i) => {
+              {visibleLeads.map((lead, i) => {
                 const mins = timers[lead.id] ?? 0
                 const isMenuOpen = openMenuId === lead.id
                 const isReplyOpen = openReplyId === lead.id
@@ -425,7 +461,7 @@ export default function Dashboard() {
                         <div className="dash-kebab-wrap">
                           <button className="dash-btn-kebab" onClick={() => setOpenMenuId(isMenuOpen ? null : lead.id)}>⋮</button>
                           {isMenuOpen && (
-                            <div className={`dash-kebab-menu${i >= activeLeads.length - 2 ? ' open-upward' : ''}`}>
+                            <div className={`dash-kebab-menu${i >= visibleLeads.length - 2 ? ' open-upward' : ''}`}>
                               <button onClick={() => handleOpenConfirmBox(lead)}>✓ Mark as Replied</button>
                               <button onClick={() => handleDelete(lead.id)}>✕ Delete</button>
                             </div>
