@@ -245,10 +245,14 @@ function humanizeText(text) {
   //     sentence → split into two sentences with a period
   //   - dash used as a short parenthetical aside → comma instead
   //
-  // REQUIRES actual whitespace on both sides before this ever fires —
-  // without that, "15-minute" or "sign-ups" (a dash-like char glued
-  // directly between letters, no spaces) would get misread as two full
-  // sentences joined together, splitting a single word in half.
+  // Whitespace around the dash is OPTIONAL here (\s*, not \s) — a real
+  // gap in an earlier version required spacing on both sides, which let
+  // no-space dash usage like "lifting—finding" pass through completely
+  // unconverted (this happened in production). Unlike the compound-word
+  // hyphen handling above, this is safe with no whitespace requirement:
+  // none of these are ASCII hyphens, and none of these specific Unicode
+  // dash characters are ever legitimately used inside a real compound
+  // word the way a plain "-" is in "15-minute" or "sign-ups".
   //
   // IMPORTANT: the match only consumes the dash + the single character
   // right after it (nextChar). We use a bounded lookahead purely to
@@ -256,7 +260,7 @@ function humanizeText(text) {
   // text is never re-inserted into the output. Only nextChar itself gets
   // transformed (capitalized or not); everything after it is left
   // completely untouched by the regex engine, so nothing gets duplicated.
-  const dashPattern = /\s(?:—|–|‒|―|⸺|⸻|－|--)\s(\S)/g
+  const dashPattern = /\s*(?:—|–|‒|―|⸺|⸻|－|--)\s*(\S)/g
   result = result.replace(dashPattern, (match, nextChar, offset, full) => {
     // Scope "before" to just the current sentence, not the whole reply —
     // otherwise, a few sentences into a long reply, this check always
@@ -304,16 +308,41 @@ function humanizeText(text) {
 
 // ─── "Too clean" heuristic ──────────────────────────────────────────────
 // Checked on the reply BEFORE humanizeText() strips dashes/semicolons, so
-// their presence can still be detected as a signal. Scores 0-6; 3+ means
+// their presence can still be detected as a signal. Scores 0-10; 3+ means
 // the reply reads more like composed prose than something typed quickly,
 // and triggers the casualize pass below. This threshold is a starting
 // guess, not scientifically tuned — watch [reply] too-clean-score logs
 // and adjust if it's firing too often or not enough.
-function tooCleanScore(text) {
+//
+// Not every check is worth the same. Most of these (semicolons, dashes,
+// filler words) are weak, generic clues — worth 1 point each. The
+// structural pitch-pivot check below is a much stronger, more specific
+// signal: it's caught a pitch dressed in fully casual wording ("Kairo can
+// sniff those posts... so you don't waste hours scrolling" scored only
+// 2/8 under equal weighting — contractions and filler made everything
+// else read as casual, so the one clue that actually mattered got
+// diluted down to nothing). Weighting it at +3 means a casual-sounding
+// pitch can cross the threshold on that signal close to on its own,
+// instead of needing to team up with unrelated weak clues to get flagged.
+//
+// productName is optional — when passed, also checks for the specific
+// "setup → problem → solution → benefit" tell: the product name followed
+// shortly by a benefit clause ("so you...", "which means..."). That's the
+// tail end of the formulaic pitch arc, and it's a real miss without this:
+// a real example that reached Reddit ("Kairo does the heavy lifting...
+// so you only spend time on prospects that are already primed") scored 2
+// under the old checks alone — under the 3-point threshold — because
+// nothing here looked for dashes or that specific structural shape.
+function tooCleanScore(text, productName) {
   let score = 0
   if (/;/.test(text)) score++
   if (/→/.test(text)) score++
   if (/\([^)]+,\s*[^)]+\)/.test(text)) score++ // parenthetical list, e.g. "(weight, sleep, activity)"
+
+  // Em/en dash and lookalikes — the single most common AI-writing tell,
+  // and previously not checked here at all (only handled downstream by
+  // humanizeText's cleanup, which itself had a gap — see that function).
+  if (/[—–‒―⸺⸻－]/.test(text)) score++
 
   const sentences = text.split(/(?<=[.!?])\s+/).filter(Boolean)
   const allProperlyPunctuated = sentences.every(s => /[.!?]$/.test(s.trim()))
@@ -324,6 +353,16 @@ function tooCleanScore(text) {
 
   const hasCasualFiller = /\b(lol|tbh|ngl|yeah|honestly|kinda|gonna|idk|anyway)\b/i.test(text)
   if (!hasCasualFiller) score++
+
+  // Structural tell: product name immediately pivoting into a benefit
+  // clause is the closing beat of the formulaic setup→problem→solution→
+  // benefit arc, regardless of how casual the wording around it sounds.
+  // Weighted +3 (not +1) — see comment above.
+  if (productName) {
+    const escaped = productName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const benefitPivot = new RegExp(`${escaped}[^.!?]*\\b(so you|which means|meaning you|so now)\\b`, 'i')
+    if (benefitPivot.test(text)) score += 3
+  }
 
   return score
 }
@@ -394,7 +433,7 @@ Write only the rewritten reply. Nothing else.`,
 // Runs Cerebras first (1M tokens/day, vs Groq's shared 200K/day pool that
 // scoring also depends on), falls back to Groq if empty/too short/a
 // genuine refusal. Shared by both initial-reply and follow-up modes.
-async function generateWithFallback(messages) {
+async function generateWithFallback(messages, productName) {
   let reply = await cerebrasReply(messages)
   reply = reply.trim()
 
@@ -428,8 +467,8 @@ async function generateWithFallback(messages) {
 
   // Check BEFORE humanizeText strips dashes/semicolons, so their
   // presence still counts as a signal for this check.
-  const cleanScore = tooCleanScore(reply)
-  console.log(`[reply] too-clean-score: ${cleanScore}/6`)
+  const cleanScore = tooCleanScore(reply, productName)
+  console.log(`[reply] too-clean-score: ${cleanScore}/10`)
   if (cleanScore >= 3) {
     console.log('[reply] reply flagged as too clean — running casualize pass')
     reply = await casualizeReply(reply)
@@ -569,8 +608,8 @@ Write like a real person continuing a casual conversation, not composed prose �
     }
 
     if (reply) {
-      const cleanScore = tooCleanScore(reply)
-      console.log(`[reply] follow-up too-clean-score: ${cleanScore}/6`)
+      const cleanScore = tooCleanScore(reply, analysis.name)
+      console.log(`[reply] follow-up too-clean-score: ${cleanScore}/10`)
       if (cleanScore >= 3) {
         console.log('[reply] follow-up reply flagged as too clean — running casualize pass')
         reply = await casualizeReply(reply)
@@ -612,6 +651,8 @@ Rules:
 - Avoid generic phrases like "I understand your frustration," "it sounds like," "game changer," "streamline," "leverage," or "at the end of the day" — these read as AI-written
 - Reference their specific situation using their own words
 - Pick ONE thing to say — one point, one piece of advice, or one reaction. Do not give a step-by-step sequence or a mini-framework covering multiple angles. Real people respond to one thing that caught their attention, not a comprehensive plan.
+- Do NOT structure the reply as setup → naming the problem → offering the solution → stating the benefit, in that order. That clean four-part arc reads as composed marketing copy even when the individual words sound casual — casual wording doesn't fix a formulaic shape underneath it.
+- Include at least one of: a tangent or thought that trails off instead of resolving cleanly, a self-directed caveat about the product's own limits, or inconsistent capitalization/spelling. Pick only one of these, not all three — real inconsistency isn't uniform. Don't force a tidy closing line; it's fine to just stop after a practical detail.
 - ${noPitch
     ? `This subreddit (r/${post.subreddit}) bans vendor/promotional replies. Do NOT mention ${analysis.name} or any product at all. Just give genuinely useful, specific advice for their exact situation — the goal here is being helpful, not generating a lead.`
     : `Mention ${analysis.name} once naturally — not as a pitch`}
@@ -626,10 +667,18 @@ Example of what a real person would actually type instead:
 
 Notice the difference: opens with a reaction, no dashes/semicolons/arrows, contractions, slightly rambling, trails off instead of wrapping up neatly, and sticks to one thread of thought instead of a organized sequence. Write your reply in that second style.
 
+Second example of what NOT to do — this one sounds casual on the surface but still follows the banned setup → problem → solution → benefit shape, and uses dashes with no spaces around them (still a dash, still a tell):
+"zero budget means you gotta go where people already hang out. i stopped chasing cold ads and just started scanning reddit for folks actually saying they need a tool like yours. that's where the buying intent lives, and you can jump into the convo with a tailored reply. Kairo does the heavy lifting—finding those posts, scoring them, and even drafting a response—so you only spend time on prospects that are already primed."
+
+Second example of a real reply instead — same underlying advice, no clean arc, one dropped thread, one self-directed caveat, no tidy ending:
+"ok so zero budget thing that actually worked for me: stop making ads nobody asked for and just... go where people are already complaining about not having a tool like this lol. i literally just search reddit for people describing the exact problem my thing solves and reply to them directly. sounds obvious but most people don't do it bc it's tedious as hell to find those posts manually
+
+anyway i've been using kairo for this, it finds the posts and kinda scores how good a fit they are, drafts something to reply with too. still gotta edit the replies myself bc the ai drafts are always a lil off but it saves me from scrolling reddit for 2 hours a day"
+
 Write only the reply text. Nothing else.`,
   }]
 
-  const reply = await generateWithFallback(messages)
+  const reply = await generateWithFallback(messages, analysis.name)
 
   if (!reply) {
     console.log('[reply] both models returned empty or rejected')
