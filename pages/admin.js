@@ -23,6 +23,11 @@ export default function Admin() {
   const [cleanupRunning, setCleanupRunning] = useState(false)
   const [seenPostsCleanupConfirm, setSeenPostsCleanupConfirm] = useState(false)
   const [seenPostsCleanupRunning, setSeenPostsCleanupRunning] = useState(false)
+  // Expandable per-user leads list — cached per user_id so re-expanding a
+  // row already viewed this session doesn't refetch.
+  const [expandedUserId, setExpandedUserId] = useState(null)
+  const [userLeadsById, setUserLeadsById] = useState({}) // { [user_id]: leads[] }
+  const [loadingLeadsFor, setLoadingLeadsFor] = useState(null)
 
   useEffect(() => {
     if (!authLoading && !user) { router.replace('/login'); return }
@@ -98,6 +103,34 @@ export default function Admin() {
   const requestPlanChange = (u, newPlan) => {
     if (newPlan === u.plan) return
     setConfirmPlanChange({ userId: u.user_id, name: u.name, currentPlan: u.plan, newPlan })
+  }
+
+  const toggleUserLeads = async (u) => {
+    // Collapse if this row is already open
+    if (expandedUserId === u.user_id) {
+      setExpandedUserId(null)
+      return
+    }
+    setExpandedUserId(u.user_id)
+
+    // Already fetched this session — no need to hit the API again
+    if (userLeadsById[u.user_id]) return
+
+    setLoadingLeadsFor(u.user_id)
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'get-user-leads', requesterEmail: user.email, targetUserId: u.user_id }),
+      })
+      const data = await res.json()
+      setUserLeadsById(prev => ({ ...prev, [u.user_id]: data.leads || [] }))
+    } catch (e) {
+      console.log('[admin] get-user-leads failed:', e.message)
+      setUserLeadsById(prev => ({ ...prev, [u.user_id]: [] }))
+    } finally {
+      setLoadingLeadsFor(null)
+    }
   }
 
   const confirmPlanChangeAction = async () => {
@@ -314,25 +347,69 @@ export default function Admin() {
             </div>
 
             <div className="admin-user-table">
-              {filteredUsers.map(u => (
-                <div key={u.user_id} className="admin-user-row">
-                  <div className="admin-user-info">
-                    <span className="admin-user-name">{u.name}</span>
-                    <span className="admin-user-email">{u.email || 'no email on file'}</span>
-                    <span className="admin-user-meta">{u.url} · signed up {formatDate(u.created_at)} · scanned {formatRelative(u.last_scan_at)}</span>
+              {filteredUsers.map(u => {
+                const isExpanded = expandedUserId === u.user_id
+                const leads = userLeadsById[u.user_id]
+                const isLoadingLeads = loadingLeadsFor === u.user_id
+
+                return (
+                  <div key={u.user_id} className="admin-user-row-wrap">
+                    <div className="admin-user-row">
+                      <button
+                        type="button"
+                        className="admin-user-expand-btn"
+                        onClick={() => toggleUserLeads(u)}
+                        aria-label={isExpanded ? 'Collapse leads' : 'Expand leads'}
+                      >
+                        {isExpanded ? '▾' : '▸'}
+                      </button>
+                      <div className="admin-user-info">
+                        <span className="admin-user-name">{u.name}</span>
+                        <span className="admin-user-email">{u.email || 'no email on file'}</span>
+                        <span className="admin-user-meta">{u.url} · signed up {formatDate(u.created_at)} · scanned {formatRelative(u.last_scan_at)}</span>
+                      </div>
+                      <select
+                        className="dash-admin-plan-select"
+                        value={u.plan}
+                        onChange={e => requestPlanChange(u, e.target.value)}
+                      >
+                        <option value="free">Free</option>
+                        <option value="starter">Starter</option>
+                        <option value="pro">Pro</option>
+                        <option value="unlimited">Unlimited</option>
+                      </select>
+                    </div>
+
+                    {isExpanded && (
+                      <div className="admin-user-leads">
+                        {isLoadingLeads ? (
+                          <p className="admin-user-leads-empty">Loading leads...</p>
+                        ) : !leads || leads.length === 0 ? (
+                          <p className="admin-user-leads-empty">No leads found for this account yet.</p>
+                        ) : (
+                          leads.map(lead => (
+                            <div key={lead.id} className="admin-user-lead-row">
+                              <div className="admin-user-lead-top">
+                                <span className="admin-user-lead-sub">r/{lead.subreddit}</span>
+                                <span className="admin-user-lead-score">Score: {lead.score}</span>
+                                {lead.deleted && <span className="admin-user-lead-tag">Deleted</span>}
+                                {lead.replied && <span className="admin-user-lead-tag">Replied</span>}
+                              </div>
+                              <a href={lead.url} target="_blank" rel="noreferrer" className="admin-user-lead-title">
+                                {lead.title}
+                              </a>
+                              {lead.specific_problem && (
+                                <p className="admin-user-lead-problem">{lead.specific_problem}</p>
+                              )}
+                              <span className="admin-user-lead-time">{formatRelative(lead.scanned_at)}</span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
                   </div>
-                  <select
-                    className="dash-admin-plan-select"
-                    value={u.plan}
-                    onChange={e => requestPlanChange(u, e.target.value)}
-                  >
-                    <option value="free">Free</option>
-                    <option value="starter">Starter</option>
-                    <option value="pro">Pro</option>
-                    <option value="unlimited">Unlimited</option>
-                  </select>
-                </div>
-              ))}
+                )
+              })}
             </div>
           </div>
 

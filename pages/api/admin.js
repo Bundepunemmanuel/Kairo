@@ -195,6 +195,22 @@ export default async function handler(req, res) {
       return res.status(200).json({ message: `Deleted ${count || 0} old seen_posts rows`, deleted: count || 0 })
     }
 
+    // ─── Get one user's leads (for the expandable list in the user table) ──
+    if (action === 'get-user-leads') {
+      const { targetUserId } = req.body
+      if (!targetUserId) return res.status(400).json({ error: 'targetUserId required' })
+
+      const { data: leads, error } = await supabaseAdmin
+        .from('leads')
+        .select('id, title, subreddit, score, scanned_at, url, signal_type, specific_problem, reason, deleted, replied')
+        .eq('user_id', targetUserId)
+        .order('scanned_at', { ascending: false })
+        .limit(200)
+      if (error) throw error
+
+      return res.status(200).json({ leads: leads || [] })
+    }
+
     // ─── Change a user's plan ─────────────────────────────────────────────
     if (action === 'set-plan') {
       const { targetUserId, newPlan } = req.body
