@@ -370,6 +370,90 @@ Deno.serve(async (req) => {
         }
       }
 
+      // ─── Karma-building (separate from lead pipeline, no pacing guard) ──
+      // Job 1: this user's top lead-generating subreddit, reusing posts
+      // already fetched above — no extra Reddit requests for this part.
+      // Job 2: a fixed list of 5 generic high-traffic subs — these DO need
+      // their own fetch since they're outside the user's normal monitored
+      // list. Runs on the same hourly cron pass, no dedicated tight poll.
+      //
+      // KNOWN COST: Job 2 fetches the same 5 subs freshly for every user,
+      // every run — with 5 users that's 25 extra Reddit requests/hour for
+      // content that's identical across users. Fine at current scale;
+      // worth turning into a shared/cached fetch (once per cron run, not
+      // once per user) if the user count grows enough for this to matter.
+      const GENERIC_KARMA_SUBS = ['AskReddit', 'CasualConversation', 'mildlyinteresting', 'todayilearned', 'NoStupidQuestions']
+
+      const toKarmaCandidates = (posts: any[], subreddit: string) =>
+        posts.map((p: any) => ({
+          id: p.id,
+          title: p.title,
+          subreddit,
+          url: p.url,
+          // upvotes/numComments intentionally omitted — Reddit's RSS feed
+          // (what fetchSubreddit uses) doesn't carry vote/comment counts,
+          // so the velocity signal in karma-comment.js stays inert until
+          // that data is available from somewhere. Content-shape doesn't
+          // need it, so this still works, just on one signal for now.
+          ageMinutes: (Date.now() - (p.createdAt || Date.now())) / 60000,
+        }))
+
+      try {
+        // Job 1
+        const { data: topLeadRows } = await supabase
+          .from('leads')
+          .select('subreddit')
+          .eq('user_id', userId)
+        if (topLeadRows?.length) {
+          const counts: Record<string, number> = {}
+          for (const r of topLeadRows) counts[r.subreddit] = (counts[r.subreddit] || 0) + 1
+          const topSub = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0]
+          const subIdx = subreddits.indexOf(topSub)
+          if (topSub && subIdx !== -1 && postArrays[subIdx]?.length) {
+            const candidates = toKarmaCandidates(postArrays[subIdx], topSub)
+            const karmaRes = await fetch(`${NEXTJS_BASE_URL}/api/karma-comment`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ candidates, source: 'lead_sub' }),
+              signal: AbortSignal.timeout(30000),
+            })
+            const { picked } = await karmaRes.json()
+            if (picked) {
+              await supabase.from('karma_drafts').insert({
+                user_id: userId, subreddit: picked.subreddit, title: picked.title,
+                url: picked.url, draft_comment: picked.draftComment,
+                source: 'lead_sub', picked_via: picked.pickedVia,
+              })
+              console.log(`[cron-scan] user ${userId}: karma draft added (lead_sub, r/${picked.subreddit})`)
+            }
+          }
+        }
+
+        // Job 2
+        const genericSub = GENERIC_KARMA_SUBS[Math.floor(Math.random() * GENERIC_KARMA_SUBS.length)]
+        const genericPosts = await fetchSubreddit(genericSub)
+        if (genericPosts?.length) {
+          const candidates = toKarmaCandidates(genericPosts, genericSub)
+          const karmaRes = await fetch(`${NEXTJS_BASE_URL}/api/karma-comment`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ candidates, source: 'generic' }),
+            signal: AbortSignal.timeout(30000),
+          })
+          const { picked } = await karmaRes.json()
+          if (picked) {
+            await supabase.from('karma_drafts').insert({
+              user_id: userId, subreddit: picked.subreddit, title: picked.title,
+              url: picked.url, draft_comment: picked.draftComment,
+              source: 'generic', picked_via: picked.pickedVia,
+            })
+            console.log(`[cron-scan] user ${userId}: karma draft added (generic, r/${picked.subreddit})`)
+          }
+        }
+      } catch (e) {
+        console.log(`[cron-scan] user ${userId}: karma-building error:`, (e as Error).message)
+      }
+
       const filteredArrays = postArrays.map((arr: any[]) =>
         arr.filter((p: any) => p.body && p.body.length > 40)
       )
