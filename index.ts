@@ -384,17 +384,17 @@ Deno.serve(async (req) => {
       // once per user) if the user count grows enough for this to matter.
       const GENERIC_KARMA_SUBS = ['AskReddit', 'CasualConversation', 'mildlyinteresting', 'todayilearned', 'NoStupidQuestions']
 
+      // Velocity/vote-based scoring was removed from karma-comment.js —
+      // Reddit's RSS feed never carries upvote/comment counts, so that
+      // signal was permanently dead weight. Picking is now 100%
+      // content-shape (title + body), which is why body is included here.
       const toKarmaCandidates = (posts: any[], subreddit: string) =>
         posts.map((p: any) => ({
           id: p.id,
           title: p.title,
+          body: p.body || '',
           subreddit,
           url: p.url,
-          // upvotes/numComments intentionally omitted — Reddit's RSS feed
-          // (what fetchSubreddit uses) doesn't carry vote/comment counts,
-          // so the velocity signal in karma-comment.js stays inert until
-          // that data is available from somewhere. Content-shape doesn't
-          // need it, so this still works, just on one signal for now.
           ageMinutes: (Date.now() - (p.createdAt || Date.now())) / 60000,
         }))
 
