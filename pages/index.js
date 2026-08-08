@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import Link from 'next/link'
 import Head from 'next/head'
-import { supabase } from '../lib/supabase'
-import { useAuth } from './_app'
+import Nav, { KairoLogo } from '../components/Nav'
+import Footer from '../components/Footer'
 
 const STATS = [
   { value: '2 min', label: 'To your first lead' },
@@ -52,16 +52,7 @@ const PRICING = [
 ]
 
 export default function Home() {
-  const { user } = useAuth()
-  const [scrolled, setScrolled] = useState(false)
-  const [menuOpen, setMenuOpen] = useState(false)
   const sectionsRef = useRef([])
-
-  useEffect(() => {
-    const onScroll = () => setScrolled(window.scrollY > 20)
-    window.addEventListener('scroll', onScroll)
-    return () => window.removeEventListener('scroll', onScroll)
-  }, [])
 
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -80,57 +71,7 @@ export default function Home() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
-      {/* Announcement */}
-      <div className="announcement">
-        <span>🔴 Try the live demo free</span>
-        <span style={{ opacity: 0.4 }}>·</span>
-        <span>Sign up free to scan automatically every day.</span>
-      </div>
-
-      {/* Nav */}
-      <nav className={`nav${scrolled ? ' scrolled' : ''}`}>
-        <div className="nav-inner">
-          <Link href="/" className="nav-logo">
-            <KairoLogo size={26} />
-            Kairo
-          </Link>
-          <div className="nav-links">
-            <a href="#how-it-works" className="nav-link">How It Works</a>
-            <a href="#pricing" className="nav-link">Pricing</a>
-            <a href="https://subscan-omega.vercel.app" target="_blank" rel="noopener noreferrer" className="nav-link">SubScan</a>
-            {user ? (
-              <>
-                <Link href="/dashboard" className="nav-link">Dashboard</Link>
-                <button
-                  onClick={async () => { await supabase.auth.signOut() }}
-                  className="nav-link"
-                  style={{ background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
-                >
-                  Sign out
-                </button>
-              </>
-            ) : (
-              <>
-                <Link href="/login" className="nav-link">Login</Link>
-                <Link href="/signup" className="nav-cta">Sign up free</Link>
-              </>
-            )}
-          </div>
-          <button className="menu-toggle" onClick={() => setMenuOpen(!menuOpen)} aria-label="Menu">
-            <span className="menu-bar" style={menuOpen ? { transform: 'rotate(45deg) translate(5px,5px)' } : {}} />
-            <span className="menu-bar" style={menuOpen ? { opacity: 0 } : {}} />
-            <span className="menu-bar" style={menuOpen ? { transform: 'rotate(-45deg) translate(5px,-5px)' } : {}} />
-          </button>
-        </div>
-        {menuOpen && (
-          <div className="mobile-menu">
-            <a href="#how-it-works" onClick={() => setMenuOpen(false)}>How It Works</a>
-            <a href="#pricing" onClick={() => setMenuOpen(false)}>Pricing</a>
-            <a href="https://subscan-omega.vercel.app" target="_blank" rel="noopener noreferrer">SubScan</a>
-            <Link href="/onboarding" className="mobile-menu-cta" onClick={() => setMenuOpen(false)}>Try Kairo Free →</Link>
-          </div>
-        )}
-      </nav>
+      <Nav />
 
       {/* Hero */}
       <div className="hero">
@@ -345,25 +286,7 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Footer */}
-      <footer className="footer">
-        <div className="footer-inner">
-          <div>
-            <div className="footer-logo"><KairoLogo size={20} />Kairo</div>
-            <p className="footer-tagline">Customer acquisition for solo founders.</p>
-          </div>
-          <div className="footer-links">
-            <a href="https://subscan-omega.vercel.app" target="_blank" rel="noopener noreferrer">SubScan</a>
-            <a href="#pricing">Pricing</a>
-            <a href="#how-it-works">How It Works</a>
-          </div>
-        </div>
-        <div className="footer-bottom">© 2026 Kairo. Built for solo founders.</div>
-      </footer>
+      <Footer />
     </>
   )
-}
-
-function KairoLogo({ size = 24 }) {
-  return <img src="/logo.png" alt="Kairo" width={size} height={size} style={{ objectFit: 'contain' }} />
 }

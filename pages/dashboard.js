@@ -27,6 +27,8 @@ export default function Dashboard() {
   // right next to a same-day one. Defaults to 'today' since that's the
   // view people actually want on a daily check-in.
   const [dateTab, setDateTab] = useState('today')
+  const [karmaDrafts, setKarmaDrafts] = useState([])
+  const [dismissingKarmaId, setDismissingKarmaId] = useState(null)
 
   // Reply state — per-lead, generated on demand via /api/reply (real feature, not a paywall)
   const [replies, setReplies] = useState({})
@@ -111,6 +113,18 @@ export default function Dashboard() {
       })
       setActiveLeads(sorted)
 
+      // Karma-building drafts — separate table, separate section, never
+      // mixed into the leads list (these aren't sales leads, and never
+      // mention the product).
+      const { data: karma } = await supabase
+        .from('karma_drafts')
+        .select('*')
+        .eq('user_id', user.id)
+        .eq('dismissed', false)
+        .order('created_at', { ascending: false })
+        .limit(10)
+      setKarmaDrafts(karma || [])
+
       const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
       const { count } = await supabase
         .from('leads')
@@ -142,6 +156,14 @@ export default function Dashboard() {
     setActiveLeads(prev => prev.filter(l => l.id !== leadId))
     const { error } = await supabase.from('leads').update({ deleted: true }).eq('id', leadId)
     if (error) { console.log('[dashboard] delete error:', error.message); await loadData() }
+  }
+
+  const handleDismissKarma = async (draftId) => {
+    setDismissingKarmaId(draftId)
+    setKarmaDrafts(prev => prev.filter(d => d.id !== draftId))
+    const { error } = await supabase.from('karma_drafts').update({ dismissed: true }).eq('id', draftId)
+    if (error) console.log('[dashboard] karma dismiss error:', error.message)
+    setDismissingKarmaId(null)
   }
 
   // "Mark as Replied" no longer marks instantly — it opens an editable
@@ -328,6 +350,40 @@ export default function Dashboard() {
             <p className="dash-quota-note">
               Your quota is a ceiling, not a guarantee — actual lead volume depends on how many people are actively talking about the problem you solve. A common, painful problem surfaces leads daily; a niche one may surface fewer, even on a higher plan.
             </p>
+
+            {karmaDrafts.length > 0 && (
+              <div className="karma-section">
+                <div className="karma-section-header">
+                  <h2 className="karma-section-title">🌱 Build karma</h2>
+                  <p className="karma-section-sub">
+                    Genuine, no-pitch comments to build account history in your top subreddits — never mentions your product. Post occasionally, spread out, in your own words.
+                  </p>
+                </div>
+                {karmaDrafts.map(draft => (
+                  <div key={draft.id} className="karma-card">
+                    <div className="karma-card-top">
+                      <span className="karma-card-sub">r/{draft.subreddit}</span>
+                      <span className="karma-card-source">{draft.source === 'generic' ? 'General' : 'Your lead sub'}</span>
+                    </div>
+                    <p className="karma-card-post-title">{draft.title}</p>
+                    <div className="karma-card-draft">{draft.draft_comment}</div>
+                    <div className="karma-card-actions">
+                      <a href={draft.url} target="_blank" rel="noreferrer" className="karma-card-open">
+                        Open in Reddit ↗
+                      </a>
+                      <button
+                        type="button"
+                        className="karma-card-dismiss"
+                        disabled={dismissingKarmaId === draft.id}
+                        onClick={() => handleDismissKarma(draft.id)}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
 
             <div className="dash-leads">
               {newLeadsCount > 0 && (
