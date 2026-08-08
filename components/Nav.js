@@ -3,7 +3,7 @@ import Link from 'next/link'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../pages/_app'
 
-export function KairoLogo({ size = 36 }) {
+export function KairoLogo({ size = 24 }) {
   return <img src="/logo.png" alt="Kairo" width={size} height={size} style={{ objectFit: 'contain' }} />
 }
 
