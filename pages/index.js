@@ -7,7 +7,7 @@ import Footer from '../components/Footer'
 const STATS = [
   { value: '2 min', label: 'To your first lead' },
   { value: '847', label: 'Posts scanned daily' },
-  { value: '9.2', label: 'Avg intent score' },
+  { value: '60.2', label: 'Avg intent score' },
   { value: '23m', label: 'Avg lead window' },
 ]
 
