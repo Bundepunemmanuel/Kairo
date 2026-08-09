@@ -1,0 +1,12 @@
+User-agent: *
+Allow: /
+Disallow: /dashboard
+Disallow: /billing
+Disallow: /settings
+Disallow: /admin
+Disallow: /debug
+Disallow: /archive
+Disallow: /auth/
+Disallow: /api/
+
+Sitemap: https://kairo-omega.vercel.app/sitemap.xml
