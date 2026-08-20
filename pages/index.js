@@ -7,7 +7,7 @@ import Footer from '../components/Footer'
 const STATS = [
   { value: '2 min', label: 'To your first lead' },
   { value: '847', label: 'Posts scanned daily' },
-  { value: '9.2', label: 'Avg intent score' },
+  { value: '60.2', label: 'Avg intent score' },
   { value: '23m', label: 'Avg lead window' },
 ]
 
@@ -101,60 +101,11 @@ export default function Home() {
         {/* Phone */}
         <div className="hero-phone">
           <div className="phone-float">
-            <div className="phone-frame">
-              <div className="phone-notch" />
-              <div className="phone-screen">
-                <div>
-                  <div className="dash-logo-row">
-                    <span className="dash-logo">Kairo</span>
-                    <span className="dash-pro">PRO</span>
-                  </div>
-                  <div className="dash-sub">Scanning 3 subreddits for buyers right now</div>
-                  <div className="dash-live"><span className="live-dot" />847 posts scanned today</div>
-                </div>
-                <div className="dash-grid">
-                  <div className="dash-card">
-                    <span className="dash-card-label">Today's Leads</span>
-                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 2 }}>
-                      <span className="dash-card-big">4</span>
-                      <span className="dash-card-small">/10</span>
-                    </div>
-                    <span className="dash-card-meta">6 remaining</span>
-                  </div>
-                  <div className="dash-card dash-card-critical">
-                    <span className="dash-card-label"><span className="critical-dot" />Critical</span>
-                    <span className="dash-card-big">1</span>
-                    <span className="dash-card-meta">Expires in 23 min</span>
-                  </div>
-                  <div className="dash-card">
-                    <span className="dash-card-label">Avg Intent Score</span>
-                    <span className="dash-card-big-white">8.1</span>
-                    <span className="dash-card-positive">+1.2 vs yesterday</span>
-                  </div>
-                  <div className="dash-card">
-                    <span className="dash-card-label">Next Scan</span>
-                    <span className="dash-card-big">1:08</span>
-                    <span className="dash-card-meta">Every 15 min</span>
-                  </div>
-                </div>
-                <div className="dash-lead">
-                  <div className="dash-lead-top">
-                    <span className="dash-lead-active">🔴 ACTIVE DEMAND</span>
-                    <span className="dash-lead-score">9.2</span>
-                  </div>
-                  <p className="dash-lead-title">Looking for a tool to find Reddit leads automatically</p>
-                  <div className="dash-lead-meta">
-                    <span className="dash-lead-sub">r/SaaS</span>
-                    <span className="dash-lead-timer">⏱ 47 min</span>
-                  </div>
-                  <div className="dash-lead-actions">
-                    <button className="dash-btn-primary">View Draft Reply</button>
-                    <button className="dash-btn-secondary">Open Reddit</button>
-                  </div>
-                </div>
-                <div className="dash-footer">Kairo is scanning r/SaaS, r/indiehackers, r/entrepreneur</div>
-              </div>
-            </div>
+            <img
+              src="/mockup.webp"
+              alt="Kairo dashboard showing real Reddit leads sorted by intent score, with one-click draft replies"
+              className="hero-mockup-img"
+            />
           </div>
         </div>
       </div>
