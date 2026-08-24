@@ -3493,3 +3493,166 @@ input { font-family: var(--font-body); outline: none; }
   border-radius: 6px;
   margin-bottom: 8px;
 }
+
+/* ── Onboarding progress banner ── */
+.onboarding-progress {
+  background: var(--white);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+}
+.onboarding-progress-bar-track {
+  width: 100%;
+  height: 6px;
+  background: var(--rust-muted);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.onboarding-progress-bar-fill {
+  height: 100%;
+  background: var(--rust);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.onboarding-progress-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.onboarding-progress-label {
+  font-size: var(--text-sm);
+  color: var(--ink-mid);
+  font-weight: 600;
+}
+.onboarding-progress-cta {
+  font-size: var(--text-sm);
+  color: var(--rust-dark);
+  font-weight: 600;
+  text-decoration: none;
+}
+.onboarding-progress-cta:hover { text-decoration: underline; }
+.onboarding-progress-waiting {
+  font-size: var(--text-sm);
+  color: var(--ink-light);
+  font-style: italic;
+}
+
+/* ── Close-match leads (onboarding free scan only) ── */
+.close-matches-section {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px dashed var(--border);
+}
+.close-matches-title {
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  color: var(--ink-mid);
+  margin-bottom: 4px;
+}
+.close-matches-sub {
+  font-size: var(--text-sm);
+  color: var(--ink-light);
+  margin-bottom: 16px;
+}
+.close-match-card {
+  background: var(--cream);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 12px;
+}
+.close-match-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.close-match-badge {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-light);
+  background: var(--white);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+.close-match-title {
+  font-size: var(--text-base);
+  color: var(--ink-mid);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.close-match-body {
+  font-size: var(--text-sm);
+  color: var(--ink-light);
+  margin-bottom: 10px;
+}
+
+/* ── Post-scan confirm-subreddits nudge ── */
+.confirm-subs-nudge {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  background: var(--rust-muted);
+  border: 1px solid var(--rust-border);
+  border-radius: 10px;
+  padding: 12px 18px;
+  margin-top: 12px;
+  font-size: var(--text-sm);
+  color: var(--ink-mid);
+}
+.confirm-subs-link {
+  color: var(--rust-dark);
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.confirm-subs-link:hover { text-decoration: underline; }
+
+/* ── Account deletion reason step ── */
+.delete-reason-box {
+  background: var(--white);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 20px;
+}
+.delete-reason-prompt {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 12px;
+}
+.delete-reason-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  color: var(--ink-mid);
+}
+.delete-reason-option input { accent-color: var(--rust); cursor: pointer; }
+.delete-reason-detail {
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: var(--text-sm);
+  resize: vertical;
+}
+.delete-reason-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}

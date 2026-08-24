@@ -1,5 +1,5 @@
 // score.js — Simple, robust, no silent failures
-// Scoring: Cerebras gpt-oss-120b (primary, 1M tokens/day) → Groq openai/gpt-oss-120b (fallback) → Nemotron 3 Ultra via OpenRouter free tier (final fallback, no retry)
+// Scoring: Gemini 3.5 Flash Lite (primary) → gpt-oss-20b via OpenRouter free tier (2nd, no shared quota risk with Gemini — swapped in from Nemotron 3 Ultra 550B, which was too large for the free tier to serve fast enough) → Groq openai/gpt-oss-120b (final fallback — reordered last after its 200K TPD quota ran out mid-day on Aug 20 and wasted the time budget every request needed for a real fallback to complete)
 
 // Vercel Hobby's default timeout (5-10s) isn't enough room for the
 // rate-limit retry wait below (up to ~30s). Hobby allows configuring
@@ -23,6 +23,15 @@ const WEIGHTS = { problem: 0.4, intent: 0.4, icp: 0.2 }
 // logs below — if posts in the 50-60 range look like real leads on manual
 // read, lower it; if posts clearing 60 look weak, raise it.
 const QUALIFY_THRESHOLD = 60
+
+// Close-match tier — only used when the caller explicitly opts in via
+// includeCloseMatches (currently just onboarding's free scan). Posts
+// scoring between this and QUALIFY_THRESHOLD are real, genuinely-scored
+// posts — just below the strict bar. Never fabricated, never shown as
+// equally strong as a qualified lead; the UI must label them clearly.
+// cron-scan (paying users' dashboard) never sends this flag, so this
+// tier is inert there — zero behavior change for existing users.
+const CLOSE_MATCH_THRESHOLD = 40
 
 function parseRetryAfterSeconds(message) {
   // Groq's TPM error looks like: "...Please try again in 30.1725s."
@@ -61,23 +70,34 @@ async function groq(messages, maxTokens, temperature, model = 'openai/gpt-oss-12
   }
 }
 
-// Third fallback only — no retry logic. By the time both Cerebras and
+// Third fallback only — no retry logic. By the time both Gemini and
 // Groq have failed, burning more time on a retry risks the function
 // timeout. Single best-effort attempt, fail-empty if it doesn't work.
-async function nemotron(messages, maxTokens, temperature) {
+// Free-tier fallback via OpenRouter. Was nvidia/nemotron-3-ultra-550b-a55b
+// (550B params) — too large for a free/shared endpoint to serve reliably;
+// it was hanging past the 20s timeout during the Aug 20 outage. Swapped
+// to gpt-oss-20b: fast enough for a free tier and behaves consistently
+// with the rest of the fallback chain.
+async function gptOss20b(messages, maxTokens, temperature) {
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
       body: JSON.stringify({
-        model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+        model: 'openai/gpt-oss-20b:free',
         messages,
         max_tokens: maxTokens,
         temperature,
       }),
+      // No timeout here previously — during the Aug 20 outage this let a
+      // hung request run until Vercel's own 60s hard-kill, instead of
+      // failing fast enough to let Groq (now the final fallback) get a
+      // real shot. 20s leaves genuine room for Groq afterward within the
+      // 60s ceiling.
+      signal: AbortSignal.timeout(20000),
     })
     const data = await res.json()
-    if (data.error) { console.log('[nemotron] error:', data.error.message); return '' }
+    if (data.error) { console.log('[gpt-oss-20b] error:', data.error.message); return '' }
     let content = data.choices?.[0]?.message?.content || ''
     // Reasoning models emit a <think>...</think> trace before the real
     // answer — strip it so it doesn't break JSON parsing or leak into
@@ -85,42 +105,39 @@ async function nemotron(messages, maxTokens, temperature) {
     content = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
     return content
   } catch (e) {
-    console.log('[nemotron] fetch error:', e.message)
+    console.log('[gpt-oss-20b] fetch error:', e.message)
     return ''
   }
 }
 
-async function cerebras(messages, maxTokens, temperature, _isRetry = false) {
+async function gemini(messages, maxTokens, temperature, _isRetry = false) {
   try {
-    const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}` },
-      body: JSON.stringify({ model: 'gpt-oss-120b', messages, max_tokens: maxTokens, temperature, reasoning_effort: 'low' }),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GEMINI_API_KEY}` },
+      body: JSON.stringify({ model: 'gemini-3.5-flash-lite', messages, max_tokens: maxTokens, temperature }),
     })
 
     if (res.status === 429 && !_isRetry) {
-      // Cerebras reports reset time via headers, not error message text.
-      const resetSeconds = parseFloat(res.headers.get('x-ratelimit-reset-tokens-minute') || '')
-      const waitSeconds = Number.isFinite(resetSeconds) ? Math.ceil(resetSeconds) + 1 : 15
-      console.log(`[cerebras] rate limited — retrying in ${waitSeconds}s`)
-      await new Promise(r => setTimeout(r, waitSeconds * 1000))
-      return cerebras(messages, maxTokens, temperature, true)
+      console.log('[gemini] rate limited — retrying in 15s')
+      await new Promise(r => setTimeout(r, 15000))
+      return gemini(messages, maxTokens, temperature, true)
     }
 
     const data = await res.json()
-    if (data.error) { console.log('[cerebras] error:', data.error.message); return '' }
+    if (data.error) { console.log('[gemini] error:', data.error.message); return '' }
     const content = data.choices?.[0]?.message?.content || ''
 
-    // Cerebras sometimes returns 200 with genuinely blank content — not an
+    // Gemini sometimes returns 200 with genuinely blank content — not an
     // error, just nothing. Retry once before falling through to Groq.
     if (!content && !_isRetry) {
-      console.log('[cerebras] empty content on success response — retrying once')
+      console.log('[gemini] empty content on success response — retrying once')
       await new Promise(r => setTimeout(r, 3000))
-      return cerebras(messages, maxTokens, temperature, true)
+      return gemini(messages, maxTokens, temperature, true)
     }
     return content
   } catch (e) {
-    console.log('[cerebras] fetch error:', e.message)
+    console.log('[gemini] fetch error:', e.message)
     return ''
   }
 }
@@ -202,27 +219,35 @@ Posts: ${JSON.stringify(input)}`,
     },
   ]
 
-  // Cerebras first — 1M tokens/day vs Groq's 200K for this workload, and
-  // scoring is by far the highest-volume call in the app (every cron run,
-  // every user). Groq is the fallback if Cerebras itself is rate limited
-  // or errors, not the other way around.
-  console.log('[score] trying Cerebras (primary)')
-  let raw = await cerebras(messages, 1500, 0.1)
+  // Gemini first — highest-volume call in the app (every cron run, every
+  // user), so it needs a fast, reliable primary.
+  //
+  // gpt-oss-20b (via OpenRouter free tier) is second, not last, as of the
+  // Aug 20 outage: Groq's 200K TPD budget was exhausted mid-day, and every
+  // request during that window burned 15-30s on a doomed rate-limit retry
+  // before ever reaching the real final fallback — which then had almost
+  // no time left before Vercel's 60s hard timeout killed the whole
+  // function. This fallback has no shared daily-token risk with Gemini's
+  // own outages, so it gets tried while there's still real time budget
+  // left, and Groq — the one actually prone to running dry — is now the
+  // true last resort instead of a wasted middle step.
+  console.log('[score] trying Gemini (primary)')
+  let raw = await gemini(messages, 4000, 0.1)
 
   if (!raw) {
-    console.log('[score] Cerebras empty — falling back to Groq')
-    raw = await groq(messages, 1500, 0.1)
+    console.log('[score] Gemini empty — falling back to gpt-oss-20b')
+    raw = await gptOss20b(messages, 2500, 0.1)
   }
 
   if (!raw) {
-    console.log('[score] Groq empty — falling back to Nemotron (final)')
-    raw = await nemotron(messages, 2500, 0.1)
+    console.log('[score] gpt-oss-20b empty — falling back to Groq (final)')
+    raw = await groq(messages, 1500, 0.1)
   }
 
   console.log(`[score] raw (150): ${raw.slice(0, 150)}`)
 
   const scored = parseJSON(raw)
-  if (!scored) { console.log('[score] parse failed'); return { scored: [], scoredUrls } }
+  if (!scored) { console.log('[score] parse failed'); return { scored: [], closeMatches: [], scoredUrls } }
 
   console.log(`[score] model returned ${scored.length} posts scored`)
 
@@ -248,6 +273,7 @@ Posts: ${JSON.stringify(input)}`,
         ? problem
         : Math.round(problem * WEIGHTS.problem + intent * WEIGHTS.intent + icp * WEIGHTS.icp)
       const qualifies = final >= QUALIFY_THRESHOLD
+      const tier = qualifies ? 'qualified' : final >= CLOSE_MATCH_THRESHOLD ? 'close' : null
 
       // Log every post's breakdown, pass or fail — this is what the old
       // code never gave us: visibility into *why* a post didn't qualify,
@@ -265,6 +291,7 @@ Posts: ${JSON.stringify(input)}`,
         intent,
         score: final, // kept as `score` downstream so cron-scan/leads consumers don't need to change
         qualifies,
+        tier,
         signalType: s.type === 'active' ? 'active' : 'passive',
         specificProblem: s.problem_text || '',
         reason: s.why || '',
@@ -273,30 +300,33 @@ Posts: ${JSON.stringify(input)}`,
     .filter(Boolean)
 
   const results = allResults.filter(r => r.qualifies)
+  // Real, genuinely-scored posts just below the strict bar. Never
+  // fabricated. Only surfaced to callers that explicitly opt in via
+  // includeCloseMatches — cron-scan never sends that flag, so this is
+  // inert for paying users' dashboards, unchanged from before.
+  const closeMatches = allResults.filter(r => r.tier === 'close')
 
-  return { scored: results, scoredUrls }
+  return { scored: results, closeMatches, scoredUrls }
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
-  const { posts, analysis } = req.body
+  const { posts, analysis, includeCloseMatches } = req.body
   if (!posts?.length || !analysis) return res.status(400).json({ error: 'posts and analysis required' })
 
   console.log(`[score] ${posts.length} posts | product: ${analysis.name}`)
 
   try {
-    const { scored, scoredUrls } = await scorePosts(posts, analysis)
-    console.log(`[score] qualified: ${scored.length}`)
+    const { scored, closeMatches, scoredUrls } = await scorePosts(posts, analysis)
+    console.log(`[score] qualified: ${scored.length}${includeCloseMatches ? ` | close matches: ${closeMatches.length}` : ''}`)
 
-    if (!scored.length) return res.status(200).json({ leads: [], scoredUrls })
+    if (!scored.length && !(includeCloseMatches && closeMatches.length)) {
+      return res.status(200).json({ leads: [], scoredUrls })
+    }
 
-    const top3 = scored.sort((a, b) => b.score - a.score).slice(0, 3)
-    console.log('[score] top3:', top3.map(s => `"${s.post.title.slice(0, 35)}" (${s.score})`).join(' | '))
-
-    // No reply generation here — replies are generated on-demand via /api/reply
-    const leads = top3.map(({ post, score, signalType, specificProblem, reason }) => {
+    const toLead = ({ post, score, signalType, specificProblem, reason, tier }) => {
       const ageMinutes = (Date.now() - (post.createdAt || Date.now())) / 60000
       const maxWindow = signalType === 'active' ? 180 : 360
       return {
@@ -305,12 +335,29 @@ export default async function handler(req, res) {
         signalType,
         specificProblem,
         reason,
+        tier: tier || 'qualified',
         draftReply: null, // generated on demand
         expiresIn: maxWindow - ageMinutes,
         expired: (maxWindow - ageMinutes) <= 0,
         commentLead: null,
       }
-    })
+    }
+
+    const top3 = scored.sort((a, b) => b.score - a.score).slice(0, 3)
+    console.log('[score] top3:', top3.map(s => `"${s.post.title.slice(0, 35)}" (${s.score})`).join(' | '))
+
+    // No reply generation here — replies are generated on-demand via /api/reply
+    let leads = top3.map(toLead)
+
+    // Close matches are additive, never a substitute for qualified leads,
+    // and only included when the caller explicitly asks — currently just
+    // onboarding's free scan. Capped at 2 so they support the qualified
+    // leads rather than crowding them out.
+    if (includeCloseMatches && closeMatches.length) {
+      const topClose = closeMatches.sort((a, b) => b.score - a.score).slice(0, 2)
+      console.log('[score] close matches:', topClose.map(s => `"${s.post.title.slice(0, 35)}" (${s.score})`).join(' | '))
+      leads = [...leads, ...topClose.map(toLead)]
+    }
 
     console.log(`[score] returning ${leads.length} leads`)
     return res.status(200).json({ leads, scoredUrls })

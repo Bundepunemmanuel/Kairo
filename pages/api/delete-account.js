@@ -13,10 +13,21 @@ const supabaseAdmin = createClient(
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
-  const { userId } = req.body
+  const { userId, email, reason, detail } = req.body
   if (!userId) return res.status(400).json({ error: 'userId required' })
 
   try {
+    // Log why they're leaving before anything is deleted — this table has
+    // no FK to auth.users, so the feedback survives the account deletion
+    // that's about to happen.
+    if (reason) {
+      const { error: feedbackError } = await supabaseAdmin.from('deletion_feedback').insert({
+        user_id: userId, email: email || null, reason, detail: detail || null,
+      })
+      if (feedbackError) console.error('[delete-account] feedback log error:', feedbackError.message)
+      // Non-fatal — never block an account deletion on feedback logging.
+    }
+
     // Explicitly delete from every table keyed by user_id, rather than
     // relying on foreign-key cascade deletes — some of these tables
     // predate this cleanup and their cascade constraints were never

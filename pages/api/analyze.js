@@ -2,41 +2,39 @@
 
 //analyze.js — Product analysis: extracts precise ICP and specific problems for any product
 
-// Cerebras (primary) → Groq (fallback) → Nemotron via OpenRouter (final fallback, no retry)
+// Gemini (primary) → Groq (fallback) → Nemotron via OpenRouter (final fallback, no retry)
 export const config = { maxDuration: 60 }
 
-async function cerebras(messages, maxTokens, temperature, _isRetry = false) {
+async function gemini(messages, maxTokens, temperature, _isRetry = false) {
   try {
-    const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}` },
-      body: JSON.stringify({ model: 'gpt-oss-120b', messages, max_tokens: maxTokens, temperature, reasoning_effort: 'low' }),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GEMINI_API_KEY}` },
+      body: JSON.stringify({ model: 'gemini-3.5-flash-lite', messages, max_tokens: maxTokens, temperature }),
     })
 
     if (res.status === 429 && !_isRetry) {
-      const resetSeconds = parseFloat(res.headers.get('x-ratelimit-reset-tokens-minute') || '')
-      const waitSeconds = Number.isFinite(resetSeconds) ? Math.ceil(resetSeconds) + 1 : 15
-      console.log(`[analyze:cerebras] rate limited — retrying in ${waitSeconds}s`)
-      await new Promise(r => setTimeout(r, waitSeconds * 1000))
-      return cerebras(messages, maxTokens, temperature, true)
+      console.log('[analyze:gemini] rate limited — retrying in 15s')
+      await new Promise(r => setTimeout(r, 15000))
+      return gemini(messages, maxTokens, temperature, true)
     }
 
     const data = await res.json()
-    console.log('[analyze:cerebras] full response:', JSON.stringify(data).slice(0, 500))
-    if (data.error) { console.log('[analyze:cerebras] error:', data.error.message); return '' }
+    console.log('[analyze:gemini] full response:', JSON.stringify(data).slice(0, 500))
+    if (data.error) { console.log('[analyze:gemini] error:', data.error.message); return '' }
     const content = data.choices?.[0]?.message?.content || ''
 
-    // Cerebras sometimes returns 200 with genuinely blank content — not an
+    // Gemini sometimes returns 200 with genuinely blank content — not an
     // error, just nothing. Retry once before giving up on it, since this
     // often looks transient rather than a real rejection.
     if (!content && !_isRetry) {
-      console.log('[analyze:cerebras] empty content on success response — retrying once')
+      console.log('[analyze:gemini] empty content on success response — retrying once')
       await new Promise(r => setTimeout(r, 3000))
-      return cerebras(messages, maxTokens, temperature, true)
+      return gemini(messages, maxTokens, temperature, true)
     }
     return content
   } catch (e) {
-    console.log('[analyze:cerebras] fetch error:', e.message)
+    console.log('[analyze:gemini] fetch error:', e.message)
     return ''
   }
 }
@@ -269,11 +267,11 @@ Return only the JSON object.`,
       },
     ]
 
-    console.log('[analyze] trying Cerebras (primary)')
-    let raw = await cerebras(messages, 1600, 0.2)
+    console.log('[analyze] trying Gemini (primary)')
+    let raw = await gemini(messages, 1600, 0.2)
 
     if (!raw) {
-      console.log('[analyze] Cerebras empty — falling back to Groq')
+      console.log('[analyze] Gemini empty — falling back to Groq')
       raw = await groq(messages, 1600, 0.2)
     }
 

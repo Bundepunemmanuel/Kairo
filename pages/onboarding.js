@@ -127,6 +127,49 @@ export default function Onboarding() {
       } catch {
         // No profile found — fine, let them onboard normally
       }
+
+      // No profile yet — check for a scan carried over from the "Keep
+      // watching for me" signup flow, so they don't have to redo the
+      // scan they already just watched run once.
+      try {
+        const pending = sessionStorage.getItem('kairo_pending_scan')
+        if (pending) {
+          const { url: pendingUrl, analysis: pendingAnalysis, leads: pendingLeads } = JSON.parse(pending)
+          sessionStorage.removeItem('kairo_pending_scan')
+
+          await supabase.from('product_profiles').upsert({
+            user_id: user.id,
+            url: pendingUrl,
+            analysis: pendingAnalysis,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'user_id' })
+
+          const qualifiedOnly = (pendingLeads || []).filter(l => l.tier !== 'close')
+          if (qualifiedOnly.length > 0) {
+            const leadsToSave = qualifiedOnly.map(lead => ({
+              user_id: user.id,
+              post_id: lead.id || lead.url,
+              title: lead.title,
+              body: lead.body || '',
+              url: lead.url,
+              subreddit: lead.subreddit,
+              score: lead.score,
+              signal_type: lead.signalType,
+              specific_problem: lead.specificProblem || '',
+              reason: lead.reason || '',
+              created_at_post: lead.createdAt || Date.now(),
+            }))
+            await supabase.from('leads').insert(leadsToSave)
+          }
+
+          router.replace('/dashboard')
+          return
+        }
+      } catch (e) {
+        console.log('[onboarding] pending scan restore error:', e.message)
+        // Non-fatal — just falls through to normal onboarding below
+      }
+
       setCheckingExisting(false)
     }
     checkExistingProfile()
@@ -259,7 +302,7 @@ export default function Onboarding() {
       const scoreRes = await fetch('/api/score', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ posts: allPosts, analysis: productAnalysis, commentsMap }),
+        body: JSON.stringify({ posts: allPosts, analysis: productAnalysis, commentsMap, includeCloseMatches: true }),
       })
 
       const { leads: scoredLeads, error: scoreError } = await scoreRes.json()
@@ -281,12 +324,17 @@ export default function Onboarding() {
             updated_at: new Date().toISOString(),
           }, { onConflict: 'user_id' })
 
-          // Save leads
-          if (scoredLeads && scoredLeads.length > 0) {
+          // Save leads — qualified tier only. Close matches are shown in
+          // the onboarding UI for context but were explicitly scoped to
+          // stay there; the real leads table has no tier concept, so
+          // saving a close match here would misrepresent it as fully
+          // qualified on the actual dashboard.
+          const qualifiedOnly = (scoredLeads || []).filter(l => l.tier !== 'close')
+          if (qualifiedOnly.length > 0) {
             // Delete old leads first
             await supabase.from('leads').delete().eq('user_id', user.id)
             // Insert new leads
-            const leadsToSave = scoredLeads.map(lead => ({
+            const leadsToSave = qualifiedOnly.map(lead => ({
               user_id: user.id,
               post_id: lead.id || lead.url,
               title: lead.title,
@@ -358,6 +406,11 @@ export default function Onboarding() {
       </div>
     )
   }
+
+  // Derived, not stored — leads can include both qualified and close-match
+  // tiers now, so any "N leads found" copy must count qualified only or
+  // it misrepresents how many actually cleared the real bar.
+  const qualifiedCount = leads.filter(l => l.tier !== 'close').length
 
   return (
     <>
@@ -481,47 +534,71 @@ export default function Onboarding() {
               </div>
             </div>
 
+            {/* Small commitment step after the first real action (Commitment
+                & Consistency) — only meaningful for a signed-in user, since
+                that's the only case where a product_profiles row exists to
+                actually confirm/adjust. Anonymous visitors get the
+                sign-up CTA further down instead. */}
+            {user && (
+              <div className="confirm-subs-nudge">
+                <span>We'll keep watching these subreddits automatically going forward.</span>
+                <Link href="/settings" className="confirm-subs-link">Add or adjust subreddits →</Link>
+              </div>
+            )}
+
             <div className="leads-wrap">
               <div className="leads-header">
                 <div>
                   <h2 className="leads-headline">
-                    {leads.length > 0
-                      ? `${leads.length} qualified ${leads.length === 1 ? 'lead' : 'leads'} found`
+                    {qualifiedCount > 0
+                      ? `${qualifiedCount} qualified ${qualifiedCount === 1 ? 'lead' : 'leads'} found`
                       : 'No qualifying leads right now'}
                   </h2>
                   <p className="leads-sub">
-                    {leads.length > 0
+                    {qualifiedCount > 0
                       ? 'Every lead matched to a specific problem you solve. Sorted by urgency.'
                       : scanStats
                         ? `Scanned ${scanStats.postsScanned} posts across ${scanStats.subreddits.length} subreddits. Nothing matched your specific problems.`
                         : 'Posts scanned but nothing matched your specific problems.'}
                   </p>
                 </div>
-                {leads.length > 0 && (
+                {qualifiedCount > 0 && (
                   <div className="free-tag">3 free · <Link href="/signup" className="upgrade-link">Sign up for more</Link></div>
                 )}
               </div>
 
-              {/* Zero results state — honest and confident */}
+              {/* Zero results state — honest, and still gives something */}
               {leads.length === 0 && (
                 <div className="no-leads-box">
                   <div className="no-leads-icon">🔍</div>
-                  <h3 className="no-leads-headline">Nothing qualified this scan</h3>
+                  <h3 className="no-leads-headline">No high-intent posts right now</h3>
                   <p className="no-leads-body">
-                    Kairo only surfaces leads where someone is <strong>specifically experiencing a problem you solve</strong>. Right now, the recent posts in your subreddits don't meet that bar.
+                    This is normal — demand for most products comes in waves, not a steady stream. Kairo only surfaces leads where someone is <strong>specifically experiencing a problem you solve</strong>, and right now the recent posts in your subreddits don't meet that bar.
                   </p>
                   <p className="no-leads-body" style={{ marginTop: 8 }}>
-                    This is a good thing — you're not wasting time on weak matches. Try again in 15–30 minutes as new posts arrive.
+                    Kairo keeps scanning every 15–30 minutes and will notify you the moment something strong appears.
                   </p>
                   <div className="no-leads-actions">
-                    <Link href="/signup" className="ob-scan-btn" style={{ textDecoration: 'none', display: 'inline-block', textAlign: 'center' }}>
-                      Sign up to get notified when leads appear →
-                    </Link>
+                    <a
+                      href="/signup"
+                      className="ob-scan-btn"
+                      style={{ textDecoration: 'none', display: 'inline-block', textAlign: 'center' }}
+                      onClick={() => {
+                        // Carry the already-computed analysis over so signup
+                        // doesn't force a redundant re-scan — restored and
+                        // saved automatically once they land back here signed in.
+                        try {
+                          sessionStorage.setItem('kairo_pending_scan', JSON.stringify({ url, analysis, leads }))
+                        } catch {}
+                      }}
+                    >
+                      Keep watching for me →
+                    </a>
                   </div>
                 </div>
               )}
 
-              {leads.map((lead, i) => {
+              {leads.filter(l => l.tier !== 'close').map((lead, i) => {
                 const mins = timers[lead.id] ?? lead.expiresIn
                 const isOpen = expandedLead === lead.id
                 const isCommentLead = !!lead.commentLead
@@ -610,6 +687,35 @@ export default function Onboarding() {
                   </div>
                 )
               })}
+
+              {/* Close matches — real, scored posts just below the strict
+                  qualify bar. Never fabricated, always labeled honestly
+                  as lower-confidence, never styled to look like a
+                  qualified lead. */}
+              {leads.filter(l => l.tier === 'close').length > 0 && (
+                <div className="close-matches-section">
+                  <h3 className="close-matches-title">Close matches</h3>
+                  <p className="close-matches-sub">
+                    Didn't quite clear the bar for a qualified lead, but real posts worth a look.
+                  </p>
+                  {leads.filter(l => l.tier === 'close').map(lead => (
+                    <div key={lead.id} className="close-match-card">
+                      <div className="close-match-top">
+                        <span className="close-match-badge">Close match</span>
+                        <span className="lead-subreddit">r/{lead.subreddit}</span>
+                        <span className="lead-score">Score: {Number(lead.score).toFixed(1)}</span>
+                      </div>
+                      <h4 className="close-match-title">{lead.title}</h4>
+                      {lead.body && (
+                        <p className="close-match-body">{lead.body.length > 180 ? lead.body.slice(0, 180) + '...' : lead.body}</p>
+                      )}
+                      <a href={lead.url} target="_blank" rel="noopener noreferrer" className="lead-btn-secondary">
+                        Open in Reddit ↗
+                      </a>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {/* Sign up CTA — only show if there were leads */}
               {leads.length > 0 && (

@@ -7,7 +7,7 @@ import Footer from '../components/Footer'
 const STATS = [
   { value: '2 min', label: 'To your first lead' },
   { value: '847', label: 'Posts scanned daily' },
-  { value: '60.2', label: 'Avg intent score' },
+  { value: '92.0', label: 'Avg intent score' },
   { value: '23m', label: 'Avg lead window' },
 ]
 
@@ -66,8 +66,15 @@ export default function Home() {
   return (
     <>
       <Head>
-        <title>Kairo — Find Customers Already Looking For You</title>
-        <meta name="description" content="Kairo scans Reddit 24/7 and surfaces people actively looking for products like yours. Stop searching manually. Start waking up to customers." />
+        <title>Kairo App — AI Reddit Lead Generation for Founders</title>
+        <meta name="description" content="Kairo is the app that scans Reddit 24/7 and surfaces people actively looking for products like yours. Stop searching manually. Start waking up to customers." />
+        <meta property="og:title" content="Kairo — AI Reddit Lead Generation for Founders" />
+        <meta property="og:description" content="Kairo scans Reddit 24/7 and surfaces people actively looking for products like yours." />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://kairo-omega.vercel.app/" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="Kairo — AI Reddit Lead Generation for Founders" />
+        <meta name="twitter:description" content="Kairo scans Reddit 24/7 and surfaces people actively looking for products like yours." />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
@@ -81,9 +88,9 @@ export default function Home() {
             Reddit is leaking customer intent right now
           </div>
           <h1 className="hero-headline">
-            Stop searching.<br />
-            <em>Start waking up</em><br />
-            to customers.
+            Your next customer is<br />
+            <em>on Reddit</em><br />
+            right now.
           </h1>
           <p className="hero-sub">
             Your next 10 customers are on Reddit right now — frustrated, asking for recommendations, ready to buy. Kairo finds them, scores their intent, and writes your reply. Before your competitors even open their laptop.

@@ -24,6 +24,8 @@ export default function Settings() {
   const [reanalyzeMessage, setReanalyzeMessage] = useState(null)
 
   const [deleteConfirm, setDeleteConfirm] = useState(false)
+  const [deleteReason, setDeleteReason] = useState('')
+  const [deleteDetail, setDeleteDetail] = useState('')
 
   const [pushSupported, setPushSupported] = useState(true)
   const [pushEnabled, setPushEnabled] = useState(false)
@@ -216,12 +218,13 @@ export default function Settings() {
 
   const handleDeleteAccount = async () => {
     if (!deleteConfirm) { setDeleteConfirm(true); return }
+    if (!deleteReason) return // button is disabled in this state anyway, belt-and-suspenders
     setDeleting(true)
     try {
       const res = await fetch('/api/delete-account', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: user.id }),
+        body: JSON.stringify({ userId: user.id, email: user.email, reason: deleteReason, detail: deleteDetail }),
       })
       const data = await res.json()
       if (data.error) {
@@ -398,9 +401,42 @@ export default function Settings() {
           {/* Danger zone */}
           <section className="settings-section settings-danger">
             <h2 className="settings-section-title">Danger Zone</h2>
-            <button className="settings-btn-danger" onClick={handleDeleteAccount} disabled={deleting}>
-              {deleting ? 'Deleting...' : deleteConfirm ? 'Click again to confirm — this cannot be undone' : 'Delete my account'}
-            </button>
+            {!deleteConfirm ? (
+              <button className="settings-btn-danger" onClick={handleDeleteAccount}>
+                Delete my account
+              </button>
+            ) : (
+              <div className="delete-reason-box">
+                <p className="delete-reason-prompt">Before you go — what's the main reason?</p>
+                {['Not finding enough good leads', 'Too expensive', 'Missing a feature I need', 'Switching to another tool', 'Just trying it out', 'Other'].map(r => (
+                  <label key={r} className="delete-reason-option">
+                    <input
+                      type="radio"
+                      name="deleteReason"
+                      value={r}
+                      checked={deleteReason === r}
+                      onChange={() => setDeleteReason(r)}
+                    />
+                    <span>{r}</span>
+                  </label>
+                ))}
+                <textarea
+                  className="delete-reason-detail"
+                  placeholder="Anything else you want to share? (optional)"
+                  value={deleteDetail}
+                  onChange={e => setDeleteDetail(e.target.value)}
+                  rows={2}
+                />
+                <div className="delete-reason-actions">
+                  <button className="settings-btn-secondary" onClick={() => { setDeleteConfirm(false); setDeleteReason(''); setDeleteDetail('') }} disabled={deleting}>
+                    Cancel
+                  </button>
+                  <button className="settings-btn-danger" onClick={handleDeleteAccount} disabled={!deleteReason || deleting}>
+                    {deleting ? 'Deleting...' : 'Confirm deletion — this cannot be undone'}
+                  </button>
+                </div>
+              </div>
+            )}
           </section>
         </div>
       </div>

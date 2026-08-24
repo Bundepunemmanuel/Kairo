@@ -1,7 +1,7 @@
 // reply.js — On-demand reply generation for a single lead
 // Called only when user taps "View Draft Reply", or from the follow-up
 // conversation loop after pasting the thread owner's response.
-// Cerebras gpt-oss-120b (primary, 1M tokens/day) → Groq openai/gpt-oss-120b (fallback) → Nemotron 3 Ultra via OpenRouter free tier (final fallback, no retry)
+// Gemini 3.5 Flash Lite (primary) → Groq openai/gpt-oss-120b (fallback) → Nemotron 3 Ultra via OpenRouter free tier (final fallback, no retry)
 
 import { createClient } from '@supabase/supabase-js'
 
@@ -10,7 +10,7 @@ const supabaseAdmin = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
-// Retries (Cerebras empty-retry, rate-limit waits) can exceed Vercel's
+// Retries (Gemini empty-retry, rate-limit waits) can exceed Vercel's
 // default 5-10s Hobby timeout — same reasoning as score.js.
 export const config = { maxDuration: 60 }
 
@@ -48,44 +48,44 @@ async function groqReply(messages) {
   }
 }
 
-async function cerebrasReply(messages, _isRetry = false) {
+async function geminiReply(messages, _isRetry = false) {
   try {
-    const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}` },
-      body: JSON.stringify({ model: 'gpt-oss-120b', messages, max_tokens: 500, temperature: 0.75, reasoning_effort: 'low' }),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GEMINI_API_KEY}` },
+      body: JSON.stringify({ model: 'gemini-3.5-flash-lite', messages, max_tokens: 500, temperature: 0.75 }),
     })
     const data = await res.json()
-    if (data.error) { console.log('[reply:cerebras] error:', data.error.message); return '' }
+    if (data.error) { console.log('[reply:gemini] error:', data.error.message); return '' }
     const raw = data.choices?.[0]?.message?.content || ''
     const finishReason = data.choices?.[0]?.finish_reason
-    console.log('[reply:cerebras] finish_reason:', finishReason, '| content length:', raw.length)
+    console.log('[reply:gemini] finish_reason:', finishReason, '| content length:', raw.length)
 
-    // Cerebras sometimes returns 200 with genuinely blank content — not an
+    // Gemini sometimes returns 200 with genuinely blank content — not an
     // error, just nothing. Retry once before falling through to Groq.
     if (!raw && !_isRetry) {
-      console.log('[reply:cerebras] empty content on success response — full response:', JSON.stringify(data).slice(0, 800))
-      console.log('[reply:cerebras] retrying once')
+      console.log('[reply:gemini] empty content on success response — full response:', JSON.stringify(data).slice(0, 800))
+      console.log('[reply:gemini] retrying once')
       await new Promise(r => setTimeout(r, 3000))
-      return cerebrasReply(messages, true)
+      return geminiReply(messages, true)
     }
 
     // Truncated mid-generation — broken output even if short enough by
     // word count. Treat as invalid, same as empty, so it falls through.
     if (finishReason === 'length') {
-      console.log('[reply:cerebras] response was truncated (finish_reason: length) — treating as invalid')
+      console.log('[reply:gemini] response was truncated (finish_reason: length) — treating as invalid')
       return ''
     }
 
-    console.log('[reply:cerebras] raw output:', JSON.stringify(raw.slice(0, 300)))
+    console.log('[reply:gemini] raw output:', JSON.stringify(raw.slice(0, 300)))
     return raw
   } catch (e) {
-    console.log('[reply:cerebras] fetch error:', e.message)
+    console.log('[reply:gemini] fetch error:', e.message)
     return ''
   }
 }
 
-// Third fallback only — no retry. By the time both Cerebras and Groq have
+// Third fallback only — no retry. By the time both Gemini and Groq have
 // failed, waiting on a retry risks the function timeout for no real gain.
 //
 // Nemotron is a reasoning model: it "thinks" before answering, and that
@@ -391,7 +391,7 @@ const STYLE_PHRASES = [
 // ─── Casualize pass ─────────────────────────────────────────────────────
 // Only runs when tooCleanScore() flags a reply as reading like composed
 // prose rather than something typed quickly. Reuses the existing
-// Cerebras→Groq functions rather than new provider-calling code. If this
+// Gemini→Groq functions rather than new provider-calling code. If this
 // call fails or comes back empty, the original reply is used as-is —
 // never lose a working reply because the polish step failed.
 async function casualizeReply(originalReply) {
@@ -413,11 +413,11 @@ Rules:
 Write only the rewritten reply. Nothing else.`,
   }]
 
-  let casualized = await cerebrasReply(messages)
+  let casualized = await geminiReply(messages)
   casualized = casualized.trim()
 
   if (!casualized || casualized.length < 15) {
-    console.log('[reply] casualize: Cerebras empty — trying Groq')
+    console.log('[reply] casualize: Gemini empty — trying Groq')
     casualized = await groqReply(messages)
     casualized = casualized.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
   }
@@ -430,18 +430,17 @@ Write only the rewritten reply. Nothing else.`,
   return casualized
 }
 
-// Runs Cerebras first (1M tokens/day, vs Groq's shared 200K/day pool that
-// scoring also depends on), falls back to Groq if empty/too short/a
-// genuine refusal. Shared by both initial-reply and follow-up modes.
+// Runs Gemini first, falls back to Groq if empty/too short/a genuine
+// refusal. Shared by both initial-reply and follow-up modes.
 async function generateWithFallback(messages, productName) {
-  let reply = await cerebrasReply(messages)
+  let reply = await geminiReply(messages)
   reply = reply.trim()
 
   const isHardReject = (text) => HARD_REJECT_PHRASES.some(p => text.toLowerCase().includes(p))
   const isTooLong = (text) => wordCount(text) > HARD_MAX_WORDS
 
   if (!reply || reply.length < 15 || isHardReject(reply) || isTooLong(reply)) {
-    console.log(reply ? `[reply] Cerebras response rejected (refusal or ${wordCount(reply)} words) — trying Groq` : '[reply] Cerebras empty — trying Groq')
+    console.log(reply ? `[reply] Gemini response rejected (refusal or ${wordCount(reply)} words) — trying Groq` : '[reply] Gemini empty — trying Groq')
     reply = await groqReply(messages)
     reply = reply.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
   }
@@ -572,11 +571,9 @@ Write like a real person continuing a casual conversation, not composed prose �
       },
     ]
 
-    // Cerebras first — same reasoning as score.js: 1M tokens/day vs Groq's
-    // 200K shared across the whole app. Groq is the fallback here now,
-    // not the primary, to stop reply generation from starving scoring's
-    // shared daily budget.
-    const raw = await cerebrasReply(followupMessages)
+    // Gemini first, Groq as fallback here now, not the primary, to stop
+    // reply generation from starving scoring's shared daily budget.
+    const raw = await geminiReply(followupMessages)
     console.log('[reply] follow-up raw:', JSON.stringify(raw.slice(0, 300)))
 
     let parsed = parseJSON(raw)
