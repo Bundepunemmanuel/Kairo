@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import Link from 'next/link'
 import Head from 'next/head'
 import { useRouter } from 'next/router'
@@ -105,6 +105,18 @@ export default function Onboarding() {
   const [replies, setReplies] = useState({}) // { [leadId]: reply text }
   const [replyLoading, setReplyLoading] = useState({}) // { [leadId]: true/false }
 
+  // ── Zero-results capture (email + push, no signup form) ──
+  const [captureEmail, setCaptureEmail] = useState('')
+  const [capturing, setCapturing] = useState(false)
+  const [captureError, setCaptureError] = useState('')
+  const [captureDone, setCaptureDone] = useState(false)
+  const [captureExisting, setCaptureExisting] = useState(false)
+  // Set right before we mint a session for a freshly-captured account, so
+  // the profile-check effect below doesn't immediately redirect to
+  // /dashboard and slam them into the password gate — they should get to
+  // see the "we'll notify you" confirmation and leave on their own terms.
+  const justCapturedRef = useRef(false)
+
   // If a logged-in user already has a saved product profile, send them straight
   // to the dashboard instead of showing the anonymous-visitor marketing funnel.
   // A logged-in user with NO saved profile yet still sees onboarding normally —
@@ -121,6 +133,11 @@ export default function Onboarding() {
           .eq('user_id', user.id)
           .single()
         if (data) {
+          if (justCapturedRef.current) {
+            justCapturedRef.current = false
+            setCheckingExisting(false)
+            return
+          }
           router.replace('/dashboard')
           return
         }
@@ -397,6 +414,101 @@ export default function Onboarding() {
     setTimeout(() => setCopiedId(null), 2000)
   }
 
+  // ── Zero-results capture ──────────────────────────────────────────────
+  // Same VAPID conversion used in settings.js's push flow.
+  const urlBase64ToUint8Array = (base64String) => {
+    const padding = '='.repeat((4 - (base64String.length % 4)) % 4)
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/')
+    const rawData = atob(base64)
+    return Uint8Array.from([...rawData].map(char => char.charCodeAt(0)))
+  }
+
+  const isIOS = () =>
+    typeof navigator !== 'undefined' && /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream
+
+  const isStandalone = () =>
+    typeof window !== 'undefined' &&
+    (window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches)
+
+  const pushIsSupported = () =>
+    typeof window !== 'undefined' && 'serviceWorker' in navigator && 'PushManager' in window
+
+  // iOS Safari only supports push once the site's been added to the home
+  // screen and reopened from there — pushIsSupported() alone doesn't
+  // capture that. Show them how, rather than a button that silently fails.
+  const needsHomeScreenInstructions = () => isIOS() && !isStandalone()
+
+  const handleCaptureLead = async () => {
+    setCaptureError('')
+    const trimmedEmail = captureEmail.trim()
+    if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+      setCaptureError('Please enter a valid email')
+      return
+    }
+
+    setCapturing(true)
+    let subscription = null
+
+    // Only attempt push where it can actually work. iOS-not-yet-installed
+    // visitors still get an account + saved scan below — they just won't
+    // get a push until they add Kairo to their home screen (see the
+    // instructions shown alongside this form) and enable it in Settings.
+    if (pushIsSupported() && !needsHomeScreenInstructions()) {
+      try {
+        const permission = await Notification.requestPermission()
+        if (permission !== 'granted') {
+          setCaptureError('Notification permission was denied. You can enable it later in your browser settings.')
+          setCapturing(false)
+          return
+        }
+        const registration = await navigator.serviceWorker.register('/sw.js')
+        await navigator.serviceWorker.ready
+        const sub = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(process.env.NEXT_PUBLIC_VAPID_KEY),
+        })
+        subscription = sub.toJSON()
+      } catch (e) {
+        console.log('[onboarding] push subscribe error:', e.message)
+        setCaptureError('Could not enable notifications. Please try again.')
+        setCapturing(false)
+        return
+      }
+    }
+
+    try {
+      const res = await fetch('/api/capture-lead', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: trimmedEmail, url, analysis, leads, subscription }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setCaptureError(data.error || 'Something went wrong. Please try again.')
+        setCapturing(false)
+        return
+      }
+
+      if (data.existingAccount) {
+        // Email already belongs to a real account — profile/push were
+        // saved under it, but we never sign into someone else's account.
+        setCaptureExisting(true)
+      } else if (data.session) {
+        justCapturedRef.current = true
+        await supabase.auth.setSession({
+          access_token: data.session.access_token,
+          refresh_token: data.session.refresh_token,
+        })
+      }
+      setCaptureDone(true)
+    } catch (e) {
+      console.log('[onboarding] capture-lead error:', e.message)
+      setCaptureError('Something went wrong. Please try again.')
+    } finally {
+      setCapturing(false)
+    }
+  }
+
   // Avoid flashing the marketing funnel while we check if a logged-in user
   // already has a saved profile and should be redirected to /dashboard instead.
   if (checkingExisting) {
@@ -579,21 +691,72 @@ export default function Onboarding() {
                     Kairo keeps scanning every 15–30 minutes and will notify you the moment something strong appears.
                   </p>
                   <div className="no-leads-actions">
-                    <a
-                      href="/signup"
-                      className="ob-scan-btn"
-                      style={{ textDecoration: 'none', display: 'inline-block', textAlign: 'center' }}
-                      onClick={() => {
-                        // Carry the already-computed analysis over so signup
-                        // doesn't force a redundant re-scan — restored and
-                        // saved automatically once they land back here signed in.
-                        try {
-                          sessionStorage.setItem('kairo_pending_scan', JSON.stringify({ url, analysis, leads }))
-                        } catch {}
-                      }}
-                    >
-                      Keep watching for me →
-                    </a>
+                    {captureDone ? (
+                      <div className="email-success">
+                        <div className="email-success-icon">✅</div>
+                        <div>
+                          <div className="email-success-title">
+                            {captureExisting ? 'You already have a Kairo account' : "You're all set"}
+                          </div>
+                          <div className="email-success-note">
+                            {captureExisting
+                              ? "We've saved this scan there — check your existing dashboard for updates."
+                              : needsHomeScreenInstructions()
+                                ? "We'll save this scan and start watching now. Add Kairo to your home screen (below) to get notified the moment something appears."
+                                : "We'll watch for you and notify you the moment something strong appears — no need to keep this tab open."}
+                          </div>
+                        </div>
+                      </div>
+                    ) : needsHomeScreenInstructions() ? (
+                      <div className="email-gate">
+                        <div className="email-gate-inner">
+                          <div className="email-gate-icon">📲</div>
+                          <h3 className="email-gate-headline">Add Kairo to your home screen</h3>
+                          <p className="email-gate-sub">
+                            Safari on iPhone only allows notifications for sites added to your home screen. Tap the Share button below, then "Add to Home Screen" — then come back here and reopen Kairo from your home screen to get notified.
+                          </p>
+                          <div className="email-gate-row">
+                            <input
+                              type="email"
+                              className="email-input"
+                              placeholder="you@example.com"
+                              value={captureEmail}
+                              onChange={e => { setCaptureEmail(e.target.value); setCaptureError('') }}
+                            />
+                            <button className="email-submit" onClick={handleCaptureLead} disabled={capturing}>
+                              {capturing ? 'Saving...' : 'Save my scan'}
+                            </button>
+                          </div>
+                          {captureError && <p className="ob-error">{captureError}</p>}
+                          <p className="email-gate-note">We'll start watching now — notifications work once you've added Kairo to your home screen.</p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="email-gate">
+                        <div className="email-gate-inner">
+                          <div className="email-gate-icon">🔔</div>
+                          <h3 className="email-gate-headline">Get notified the moment something appears</h3>
+                          <p className="email-gate-sub">
+                            Leave your email and enable browser notifications — no password, no signup form.
+                          </p>
+                          <div className="email-gate-row">
+                            <input
+                              type="email"
+                              className="email-input"
+                              placeholder="you@example.com"
+                              value={captureEmail}
+                              onChange={e => { setCaptureEmail(e.target.value); setCaptureError('') }}
+                              onKeyDown={e => e.key === 'Enter' && handleCaptureLead()}
+                            />
+                            <button className="email-submit" onClick={handleCaptureLead} disabled={capturing}>
+                              {capturing ? 'Setting up...' : 'Notify me'}
+                            </button>
+                          </div>
+                          {captureError && <p className="ob-error">{captureError}</p>}
+                          <p className="email-gate-note">We'll ask your browser for notification permission — nothing else.</p>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

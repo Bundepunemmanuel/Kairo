@@ -5,6 +5,7 @@ import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
 import { useAuth } from './_app'
 import OnboardingProgress from '../components/OnboardingProgress'
+import PasswordGateModal from '../components/PasswordGateModal'
 
 const PLAN_LIMITS = { free: 3, starter: 10, pro: 50, unlimited: 999999 }
 const PLAN_LABELS = { free: 'Free', starter: 'Starter', pro: 'Pro', unlimited: 'Unlimited' }
@@ -279,6 +280,10 @@ export default function Dashboard() {
 
       <div className="dash-page">
         <AppNav user={user} plan={plan} active="dashboard" onSignOut={handleSignOut} />
+
+        {profile && profile.password_set === false && (
+          <PasswordGateModal onDone={() => setProfile(p => ({ ...p, password_set: true }))} />
+        )}
 
         {neverScanned ? (
           <div className="dash-empty-profile">

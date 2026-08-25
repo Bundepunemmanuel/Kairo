@@ -1044,6 +1044,67 @@ input { font-family: var(--font-body); outline: none; }
   padding: 0 4px;
 }
 
+/* ── Password gate modal (passwordless-account onboarding) ── */
+.pw-gate-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 16, 12, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 1000;
+}
+.pw-gate-card {
+  background: var(--cream, #fff);
+  border-radius: 16px;
+  padding: 36px 32px;
+  max-width: 400px;
+  width: 100%;
+  text-align: center;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
+}
+.pw-gate-icon { font-size: 2rem; margin-bottom: 14px; }
+.pw-gate-headline {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 8px;
+}
+.pw-gate-sub {
+  font-size: 0.85rem;
+  color: var(--ink-light);
+  line-height: 1.6;
+  margin-bottom: 22px;
+}
+.pw-gate-form { display: flex; flex-direction: column; gap: 12px; }
+.pw-gate-field { width: 100%; }
+.pw-gate-input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 0.95rem;
+  color: var(--ink);
+  background: white;
+}
+.pw-gate-input:focus { outline: none; border-color: var(--rust); }
+.pw-gate-error { font-size: 0.82rem; color: var(--rust); text-align: left; padding: 0 2px; margin: -2px 0; }
+.pw-gate-submit {
+  background: var(--rust);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 13px 20px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.pw-gate-submit:hover { background: var(--rust-dark); }
+.pw-gate-submit:disabled { opacity: 0.6; cursor: default; }
+
 /* ── Reply Gate Box ── */
 .reply-gate-box {
   background: linear-gradient(135deg, rgba(192,88,74,0.06) 0%, rgba(192,88,74,0.02) 100%);
