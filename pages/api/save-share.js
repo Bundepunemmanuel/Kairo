@@ -52,7 +52,10 @@ export default async function handler(req, res) {
       return { ...lead, reply: reply || REPLY_FALLBACK, replyFailed: !reply }
     })
 
-    const token = crypto.randomBytes(20).toString('hex')
+    // base64url instead of hex packs more entropy per character, so this
+    // stays unguessable (72 bits — far beyond brute-forceable) at roughly
+    // a third the length: ~12 chars instead of 40.
+    const token = crypto.randomBytes(9).toString('base64url')
     const expiresAt = new Date(Date.now() + SHARE_TTL_DAYS * 24 * 60 * 60 * 1000).toISOString()
 
     const { error: insertErr } = await supabaseAdmin.from('shared_scans').insert({
