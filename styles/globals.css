@@ -1044,6 +1044,44 @@ input { font-family: var(--font-body); outline: none; }
   padding: 0 4px;
 }
 
+/* ── Share page CTA row ── */
+.share-cta-row {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+}
+
+/* ── Save & Share Leads (onboarding results header) ── */
+.save-share-row {
+  padding: 0 0 16px;
+}
+.share-result {
+  background: rgba(180, 140, 80, 0.08);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.share-result-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--ink);
+  display: block;
+  margin-bottom: 8px;
+}
+.share-result-row {
+  display: flex;
+  gap: 8px;
+}
+.share-result-input {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 0.82rem;
+  color: var(--ink-light);
+  background: white;
+}
+
 /* ── Password gate modal (passwordless-account onboarding) ── */
 .pw-gate-overlay {
   position: fixed;

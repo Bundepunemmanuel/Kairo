@@ -4,6 +4,7 @@ import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
 import { useAuth } from './_app'
+import { pushIsSupported, needsHomeScreenInstructions, subscribeToPush } from '../lib/push'
 
 const LOADING_STATES = [
   'Reading your product...',
@@ -116,6 +117,12 @@ export default function Onboarding() {
   // /dashboard and slam them into the password gate — they should get to
   // see the "we'll notify you" confirmation and leave on their own terms.
   const justCapturedRef = useRef(false)
+
+  // ── Save & Share Leads ──
+  const [sharing, setSharing] = useState(false)
+  const [shareToken, setShareToken] = useState(null)
+  const [shareError, setShareError] = useState('')
+  const [shareCopied, setShareCopied] = useState(false)
 
   // If a logged-in user already has a saved product profile, send them straight
   // to the dashboard instead of showing the anonymous-visitor marketing funnel.
@@ -415,29 +422,6 @@ export default function Onboarding() {
   }
 
   // ── Zero-results capture ──────────────────────────────────────────────
-  // Same VAPID conversion used in settings.js's push flow.
-  const urlBase64ToUint8Array = (base64String) => {
-    const padding = '='.repeat((4 - (base64String.length % 4)) % 4)
-    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/')
-    const rawData = atob(base64)
-    return Uint8Array.from([...rawData].map(char => char.charCodeAt(0)))
-  }
-
-  const isIOS = () =>
-    typeof navigator !== 'undefined' && /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream
-
-  const isStandalone = () =>
-    typeof window !== 'undefined' &&
-    (window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches)
-
-  const pushIsSupported = () =>
-    typeof window !== 'undefined' && 'serviceWorker' in navigator && 'PushManager' in window
-
-  // iOS Safari only supports push once the site's been added to the home
-  // screen and reopened from there — pushIsSupported() alone doesn't
-  // capture that. Show them how, rather than a button that silently fails.
-  const needsHomeScreenInstructions = () => isIOS() && !isStandalone()
-
   const handleCaptureLead = async () => {
     setCaptureError('')
     const trimmedEmail = captureEmail.trim()
@@ -455,22 +439,10 @@ export default function Onboarding() {
     // instructions shown alongside this form) and enable it in Settings.
     if (pushIsSupported() && !needsHomeScreenInstructions()) {
       try {
-        const permission = await Notification.requestPermission()
-        if (permission !== 'granted') {
-          setCaptureError('Notification permission was denied. You can enable it later in your browser settings.')
-          setCapturing(false)
-          return
-        }
-        const registration = await navigator.serviceWorker.register('/sw.js')
-        await navigator.serviceWorker.ready
-        const sub = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: urlBase64ToUint8Array(process.env.NEXT_PUBLIC_VAPID_KEY),
-        })
-        subscription = sub.toJSON()
+        subscription = await subscribeToPush()
       } catch (e) {
         console.log('[onboarding] push subscribe error:', e.message)
-        setCaptureError('Could not enable notifications. Please try again.')
+        setCaptureError(e.code === 'permission_denied' ? e.message : 'Could not enable notifications. Please try again.')
         setCapturing(false)
         return
       }
@@ -506,6 +478,29 @@ export default function Onboarding() {
       setCaptureError('Something went wrong. Please try again.')
     } finally {
       setCapturing(false)
+    }
+  }
+
+  const handleSaveShare = async () => {
+    setShareError('')
+    setSharing(true)
+    try {
+      const res = await fetch('/api/save-share', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, analysis, leads }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setShareError(data.error || 'Something went wrong. Please try again.')
+        return
+      }
+      setShareToken(data.token)
+    } catch (e) {
+      console.log('[onboarding] save-share error:', e.message)
+      setShareError('Something went wrong. Please try again.')
+    } finally {
+      setSharing(false)
     }
   }
 
@@ -678,6 +673,41 @@ export default function Onboarding() {
                   <div className="free-tag">3 free · <Link href="/signup" className="upgrade-link">Sign up for more</Link></div>
                 )}
               </div>
+
+              {qualifiedCount > 0 && (
+                <div className="save-share-row">
+                  {shareToken ? (
+                    <div className="share-result">
+                      <span className="share-result-label">🔗 Link ready · expires in 7 days</span>
+                      <div className="share-result-row">
+                        <input
+                          className="share-result-input"
+                          readOnly
+                          value={typeof window !== 'undefined' ? `${window.location.origin}/share/${shareToken}` : ''}
+                          onFocus={e => e.target.select()}
+                        />
+                        <button
+                          className="copy-btn"
+                          onClick={() => {
+                            navigator.clipboard.writeText(`${window.location.origin}/share/${shareToken}`)
+                            setShareCopied(true)
+                            setTimeout(() => setShareCopied(false), 2000)
+                          }}
+                        >
+                          {shareCopied ? 'Copied!' : 'Copy link'}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <button className="lead-btn-secondary" onClick={handleSaveShare} disabled={sharing}>
+                        {sharing ? 'Generating replies & saving...' : '🔗 Save & Share Leads'}
+                      </button>
+                      {shareError && <p className="ob-error">{shareError}</p>}
+                    </>
+                  )}
+                </div>
+              )}
 
               {/* Zero results state — honest, and still gives something */}
               {leads.length === 0 && (
