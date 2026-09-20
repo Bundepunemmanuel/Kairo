@@ -1,11 +1,9 @@
 // og.js — Generates the image shown in link previews (Slack, Twitter,
 // iMessage, etc). Two modes:
 //   ?token=xxx  → real numbers from that share: qualified lead count,
-//                 product name, actual subreddits scanned
-//   no token, or an expired/unknown one → a generic branded fallback with
-//                 an illustrative example card (NOT a real captured lead —
-//                 deliberately generic so it never misrepresents a
-//                 specific real post as something it isn't)
+//                 product name, actual subreddits scanned (light/cream card)
+//   no token, or an expired/unknown one → a generic branded fallback, dark
+//                 background, no fabricated numbers or captured leads
 //
 // Edge runtime is required for next/og's ImageResponse.
 
@@ -21,11 +19,22 @@ const RUST = '#c0584a'
 const RUST_TEXT = '#8a3b2c'
 const RUST_BG = 'rgba(192,88,74,0.12)'
 
-function Logo() {
+// Recreates the actual logo mark (three bars + a circle, public/logo.png)
+// as flex/div shapes rather than embedding the PNG — the source file has
+// a solid white background baked in, which would show as a visible white
+// box on the dark fallback card below.
+function Logo({ textColor }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-      <div style={{ display: 'flex', width: 28, height: 28, borderRadius: 6, background: RUST }} />
-      <span style={{ fontSize: 22, fontWeight: 700, color: INK }}>Kairo</span>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5, alignItems: 'flex-end' }}>
+          <div style={{ display: 'flex', height: 8, width: 40, borderRadius: 8, background: RUST }} />
+          <div style={{ display: 'flex', height: 8, width: 64, borderRadius: 8, background: RUST }} />
+          <div style={{ display: 'flex', height: 8, width: 52, borderRadius: 8, background: RUST }} />
+        </div>
+        <div style={{ display: 'flex', width: 34, height: 34, borderRadius: '50%', background: RUST }} />
+      </div>
+      <span style={{ display: 'flex', fontSize: 22, fontWeight: 700, color: textColor }}>Kairo</span>
     </div>
   )
 }
@@ -69,7 +78,7 @@ export default async function handler(req) {
           width: '100%', height: '100%', display: 'flex', flexDirection: 'column',
           justifyContent: 'space-between', background: CREAM, padding: '64px 72px',
         }}>
-          <Logo />
+          <Logo textColor={INK} />
           <div style={{ display: 'flex', flexDirection: 'column' }}>
             <div style={{ display: 'flex', fontSize: 66, fontWeight: 700, color: INK, lineHeight: 1.15 }}>
               {headline}
@@ -95,43 +104,33 @@ export default async function handler(req) {
   }
 
   // ── Default fallback — homepage shares, or an expired/unknown token ──
+  // Dark background, no example card: headline + subheadline carry the
+  // whole thing, with one small badge instead of a full mocked lead card.
   return new ImageResponse(
     (
       <div style={{
         width: '100%', height: '100%', display: 'flex', flexDirection: 'column',
-        justifyContent: 'space-between', background: CREAM, padding: '56px 72px',
+        justifyContent: 'space-between', background: INK, padding: '64px 72px',
       }}>
-        <Logo />
-
-        <div style={{
-          display: 'flex', flexDirection: 'column', background: 'white', borderRadius: 16,
-          padding: '28px 32px', border: `1px solid rgba(26,18,8,0.1)`, maxWidth: 640,
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-            <div style={{ display: 'flex', fontSize: 16, padding: '4px 14px', borderRadius: 20, background: RUST_BG, color: RUST_TEXT }}>
-              r/SaaS
-            </div>
-            <div style={{ display: 'flex', fontSize: 16, color: INK_MUTED }}>Score: 94.0</div>
-          </div>
-          <div style={{ display: 'flex', fontSize: 27, fontWeight: 700, color: INK, marginBottom: 10 }}>
-            Finding clients
-          </div>
-          <div style={{ display: 'flex', fontSize: 18, color: '#5c5346', lineHeight: 1.5 }}>
-            &quot;How do you find clients that may really be interested in what you built?&quot;
-          </div>
-          <div style={{ display: 'flex', marginTop: 16, fontSize: 16, color: RUST_TEXT, fontWeight: 600 }}>
-            🎯 High-intent match
-          </div>
-        </div>
+        <Logo textColor={CREAM} />
 
         <div style={{ display: 'flex', flexDirection: 'column' }}>
-          <div style={{ display: 'flex', fontSize: 48, fontWeight: 700, color: INK, lineHeight: 1.2 }}>
+          <div style={{ display: 'flex', fontSize: 58, fontWeight: 700, color: CREAM, lineHeight: 1.2, maxWidth: 1000 }}>
             Your next customer is on Reddit right now
           </div>
-          <div style={{ display: 'flex', fontSize: 24, color: INK_MUTED, marginTop: 10 }}>
-            Kairo finds posts like this and drafts your reply
+          <div style={{ display: 'flex', fontSize: 28, color: 'rgba(245,240,235,0.6)', marginTop: 18, maxWidth: 820 }}>
+            Kairo finds people already asking for what you sell
+          </div>
+          <div style={{
+            display: 'flex', alignSelf: 'flex-start', alignItems: 'center', gap: 8, marginTop: 30,
+            fontSize: 18, padding: '9px 22px', borderRadius: 30,
+            background: 'rgba(192,88,74,0.2)', color: '#e79684',
+          }}>
+            🎯 High-intent leads, every day
           </div>
         </div>
+
+        <div style={{ display: 'flex' }} />
       </div>
     ),
     { width: 1200, height: 630 }
