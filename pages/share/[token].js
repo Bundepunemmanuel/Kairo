@@ -1,9 +1,9 @@
-import { useState, useEffect } from 'react'
-import { useRouter } from 'next/router'
+import { useState } from 'react'
 import Link from 'next/link'
 import Head from 'next/head'
 import { supabase } from '../../lib/supabase'
 import { pushIsSupported, needsHomeScreenInstructions, subscribeToPush } from '../../lib/push'
+import { getShareByToken } from '../../lib/getShareData'
 
 // ─── Reddit parsing — duplicated from onboarding.js rather than shared,
 // matching this codebase's existing pattern of per-page helpers (e.g.
@@ -71,12 +71,19 @@ const isValidUrl = str => {
   catch { return false }
 }
 
-export default function SharePage() {
-  const router = useRouter()
-  const { token } = router.query
+// SSR, not client fetch — the only page in this app that needs it. Link
+// preview bots (Slack, Twitter, iMessage) read only the first server
+// response and don't wait for or execute client-side fetches, so the
+// og:title/og:image tags below have to be correct before this component
+// ever runs in a browser.
+export async function getServerSideProps({ params }) {
+  const result = await getShareByToken(params.token)
+  return { props: { token: params.token, initialStatus: result.status, initialData: result.data || null } }
+}
 
-  const [status, setStatus] = useState('loading') // loading | ready | not_found | expired | error
-  const [data, setData] = useState(null)
+export default function SharePage({ token, initialStatus, initialData }) {
+  const status = initialStatus // ready | not_found | expired
+  const data = initialData
   const [copiedId, setCopiedId] = useState(null)
 
   const [notifyUrl, setNotifyUrl] = useState('')
@@ -86,22 +93,6 @@ export default function SharePage() {
   const [notifyError, setNotifyError] = useState('')
   const [notifyExisting, setNotifyExisting] = useState(false)
 
-  useEffect(() => {
-    if (!router.isReady || !token) return
-    ;(async () => {
-      try {
-        const res = await fetch(`/api/get-share?token=${encodeURIComponent(token)}`)
-        if (res.status === 404) return setStatus('not_found')
-        if (res.status === 410) return setStatus('expired')
-        if (!res.ok) return setStatus('error')
-        const json = await res.json()
-        setData(json)
-        setStatus('ready')
-      } catch {
-        setStatus('error')
-      }
-    })()
-  }, [router.isReady, token])
 
   const handleCopy = (id, text) => {
     navigator.clipboard.writeText(text)
@@ -199,20 +190,13 @@ export default function SharePage() {
     ? Math.max(1, Math.ceil((new Date(data.expires_at) - new Date()) / (24 * 60 * 60 * 1000)))
     : null
 
-  if (status === 'loading') {
-    return (
-      <div className="dash-loading">
-        <div className="dash-loading-inner">
-          <KairoLogo size={32} />
-          <p>Loading shared leads...</p>
-        </div>
-      </div>
-    )
-  }
-
-  if (status === 'not_found' || status === 'error') {
+  if (status === 'not_found') {
     return (
       <div className="ob-page">
+        <Head>
+          <title>Link not found — Kairo</title>
+          <meta name="robots" content="noindex" />
+        </Head>
         <div className="ob-stage">
           <div className="ob-gate-content">
             <div className="gate-icon">🔍</div>
@@ -230,6 +214,10 @@ export default function SharePage() {
   if (status === 'expired') {
     return (
       <div className="ob-page">
+        <Head>
+          <title>This link has expired — Kairo</title>
+          <meta name="robots" content="noindex" />
+        </Head>
         <div className="ob-stage">
           <div className="ob-gate-content">
             <div className="gate-icon">⏳</div>
@@ -254,6 +242,16 @@ export default function SharePage() {
         <title>{analysis.name} — Leads found by Kairo</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="robots" content="noindex" />
+        <meta property="og:title" content={`${qualified.length > 0 ? `${qualified.length} qualified leads found` : 'Leads found'} for ${analysis.name}`} />
+        <meta property="og:description" content="Kairo scans Reddit and finds people already asking for solutions like yours." />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content={`https://kairo-omega.vercel.app/share/${token}`} />
+        <meta property="og:image" content={`https://kairo-omega.vercel.app/api/og?token=${token}`} />
+        <meta property="og:image:width" content="1200" />
+        <meta property="og:image:height" content="630" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content={`${analysis.name} — Leads found by Kairo`} />
+        <meta name="twitter:image" content={`https://kairo-omega.vercel.app/api/og?token=${token}`} />
       </Head>
 
       <div className="ob-page">

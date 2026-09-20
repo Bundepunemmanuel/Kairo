@@ -72,9 +72,13 @@ export default function Home() {
         <meta property="og:description" content="Kairo scans Reddit 24/7 and surfaces people actively looking for products like yours." />
         <meta property="og:type" content="website" />
         <meta property="og:url" content="https://kairo-omega.vercel.app/" />
+        <meta property="og:image" content="https://kairo-omega.vercel.app/api/og" />
+        <meta property="og:image:width" content="1200" />
+        <meta property="og:image:height" content="630" />
         <meta name="twitter:card" content="summary_large_image" />
         <meta name="twitter:title" content="Kairo — AI Reddit Lead Generation for Founders" />
         <meta name="twitter:description" content="Kairo scans Reddit 24/7 and surfaces people actively looking for products like yours." />
+        <meta name="twitter:image" content="https://kairo-omega.vercel.app/api/og" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
