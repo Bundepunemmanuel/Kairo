@@ -8,5 +8,6 @@ Disallow: /debug
 Disallow: /archive
 Disallow: /auth/
 Disallow: /api/
+Allow: /api/og
 
 Sitemap: https://kairo-omega.vercel.app/sitemap.xml
