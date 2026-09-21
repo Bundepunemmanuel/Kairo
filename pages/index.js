@@ -72,13 +72,13 @@ export default function Home() {
         <meta property="og:description" content="Kairo scans Reddit 24/7 and surfaces people actively looking for products like yours." />
         <meta property="og:type" content="website" />
         <meta property="og:url" content="https://kairo-omega.vercel.app/" />
-        <meta property="og:image" content="https://kairo-omega.vercel.app/api/og" />
+        <meta property="og:image" content="https://kairo-omega.vercel.app/api/og?v=2" />
         <meta property="og:image:width" content="1200" />
         <meta property="og:image:height" content="630" />
         <meta name="twitter:card" content="summary_large_image" />
         <meta name="twitter:title" content="Kairo — AI Reddit Lead Generation for Founders" />
         <meta name="twitter:description" content="Kairo scans Reddit 24/7 and surfaces people actively looking for products like yours." />
-        <meta name="twitter:image" content="https://kairo-omega.vercel.app/api/og" />
+        <meta name="twitter:image" content="https://kairo-omega.vercel.app/api/og?v=2" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
@@ -97,7 +97,7 @@ export default function Home() {
             right now.
           </h1>
           <p className="hero-sub">
-            Your next 10 customers are on Reddit right now — frustrated, asking for recommendations, ready to buy. Kairo finds them, scores their intent, and writes your reply. Before your competitors even open their laptop.
+            Your next 10 customers are on Reddit right now — frustrated, asking for recommendations, ready to buy. Kairo finds them, scores their intent, and writes your reply. Before your competitor does.
           </p>
           <div className="hero-ctas">
             <Link href="/onboarding" className="btn-primary">Find My First Customer →</Link>
