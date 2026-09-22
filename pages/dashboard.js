@@ -4,8 +4,10 @@ import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
 import { useAuth } from './_app'
+import ScoreGauge from '../components/ScoreGauge'
 import OnboardingProgress from '../components/OnboardingProgress'
 import PasswordGateModal from '../components/PasswordGateModal'
+import { pushIsSupported, needsHomeScreenInstructions, subscribeToPush } from '../lib/push'
 
 const PLAN_LIMITS = { free: 3, starter: 10, pro: 50, unlimited: 999999 }
 const PLAN_LABELS = { free: 'Free', starter: 'Starter', pro: 'Pro', unlimited: 'Unlimited' }
@@ -24,6 +26,9 @@ export default function Dashboard() {
   const [openMenuId, setOpenMenuId] = useState(null)
   const [lastSeenAt, setLastSeenAt] = useState(null)
   const [neverScanned, setNeverScanned] = useState(false)
+  const [pushEnabled, setPushEnabled] = useState(true) // assume true until checked, so the banner never flashes on for a split second
+  const [pushBannerBusy, setPushBannerBusy] = useState(false)
+  const [pushBannerError, setPushBannerError] = useState('')
   // Today/Older filter — leads were previously all sorted together by
   // score/new-ness with no date grouping, so a 15-day-old lead could sit
   // right next to a same-day one. Defaults to 'today' since that's the
@@ -93,6 +98,12 @@ export default function Dashboard() {
       const prevSeenAt = settingsData?.last_seen_leads_at || null
       setLastSeenAt(prevSeenAt)
 
+      const { data: pushRows } = await supabase
+        .from('push_subscriptions')
+        .select('id')
+        .eq('user_id', user.id)
+      setPushEnabled((pushRows?.length || 0) > 0)
+
       const { data: active } = await supabase
         .from('leads')
         .select('*')
@@ -137,6 +148,34 @@ export default function Dashboard() {
   const handleSignOut = async () => {
     await supabase.auth.signOut()
     router.push('/')
+  }
+
+  // Inline "enable notifications" banner action — same permission →
+  // register → subscribe flow used in onboarding.js and settings.js, just
+  // reused via lib/push.js instead of re-implemented here. No redirect to
+  // Settings needed; this handles it right where the reminder is shown.
+  const handleEnableNotifications = async () => {
+    setPushBannerError('')
+    setPushBannerBusy(true)
+    try {
+      const subscription = await subscribeToPush()
+      const { error } = await supabase.from('push_subscriptions').upsert(
+        {
+          user_id: user.id,
+          endpoint: subscription.endpoint,
+          p256dh: subscription.keys.p256dh,
+          auth_key: subscription.keys.auth,
+        },
+        { onConflict: 'user_id,endpoint' }
+      )
+      if (error) throw error
+      setPushEnabled(true)
+    } catch (e) {
+      console.log('[dashboard] enable notifications error:', e.message)
+      setPushBannerError(e.code === 'permission_denied' ? e.message : 'Could not enable notifications. Please try again.')
+    } finally {
+      setPushBannerBusy(false)
+    }
   }
 
   const handleDelete = async (leadId) => {
@@ -275,7 +314,7 @@ export default function Dashboard() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+        <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
       </Head>
 
       <div className="dash-page">
@@ -283,6 +322,24 @@ export default function Dashboard() {
 
         {profile && profile.password_set === false && (
           <PasswordGateModal onDone={() => setProfile(p => ({ ...p, password_set: true }))} />
+        )}
+
+        {!neverScanned && profile?.password_set !== false && !pushEnabled && (
+          <div className="notif-reminder-banner">
+            {needsHomeScreenInstructions() ? (
+              <span>
+                🔔 Add Kairo to your home screen to get notified the moment a new lead appears.
+              </span>
+            ) : (
+              <>
+                <span>🔔 You haven't enabled notifications — turn them on so Kairo can alert you the moment a new lead appears.</span>
+                <button className="notif-reminder-btn" onClick={handleEnableNotifications} disabled={pushBannerBusy}>
+                  {pushBannerBusy ? 'Enabling...' : 'Enable notifications'}
+                </button>
+              </>
+            )}
+            {pushBannerError && <span className="notif-reminder-error">{pushBannerError}</span>}
+          </div>
         )}
 
         {neverScanned ? (
@@ -405,7 +462,7 @@ export default function Dashboard() {
                           {lead.signal_type === 'active' ? '🔴 Active' : '🟡 Passive'}
                         </span>
                         <span className="dash-lead-sub">r/{lead.subreddit}</span>
-                        <span className="dash-lead-score">Score: {Number(lead.score).toFixed(1)}</span>
+                        <ScoreGauge score={lead.score} />
                       </div>
                       <div className="dash-timer" style={{ color: timerColor(mins) }}>
                         <span className="dash-timer-dot" style={{ background: timerColor(mins) }} />

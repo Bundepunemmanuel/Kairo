@@ -19,28 +19,20 @@ const RUST = '#c0584a'
 const RUST_TEXT = '#8a3b2c'
 const RUST_BG = 'rgba(192,88,74,0.12)'
 
-// Recreates the actual logo mark (three bars + a circle, public/logo.png)
-// as flex/div shapes rather than embedding the PNG — the source file has
-// a solid white background baked in, which would show as a visible white
-// box on the dark fallback card below.
-function Logo({ textColor }) {
+// Embeds the real public/logo.png — needs an absolute URL since this runs
+// in the edge runtime with no page context, but otherwise this is just
+// the same file every other component in the app already references.
+function Logo({ textColor, origin }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 5, alignItems: 'flex-end' }}>
-          <div style={{ display: 'flex', height: 8, width: 40, borderRadius: 8, background: RUST }} />
-          <div style={{ display: 'flex', height: 8, width: 64, borderRadius: 8, background: RUST }} />
-          <div style={{ display: 'flex', height: 8, width: 52, borderRadius: 8, background: RUST }} />
-        </div>
-        <div style={{ display: 'flex', width: 34, height: 34, borderRadius: '50%', background: RUST }} />
-      </div>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+      <img src={`${origin}/logo.png`} width={34} height={34} style={{ display: 'flex' }} />
       <span style={{ display: 'flex', fontSize: 22, fontWeight: 700, color: textColor }}>Kairo</span>
     </div>
   )
 }
 
 export default async function handler(req) {
-  const { searchParams } = new URL(req.url)
+  const { searchParams, origin } = new URL(req.url)
   const token = searchParams.get('token')
 
   let shareData = null
@@ -78,7 +70,7 @@ export default async function handler(req) {
           width: '100%', height: '100%', display: 'flex', flexDirection: 'column',
           justifyContent: 'space-between', background: CREAM, padding: '64px 72px',
         }}>
-          <Logo textColor={INK} />
+          <Logo textColor={INK} origin={origin} />
           <div style={{ display: 'flex', flexDirection: 'column' }}>
             <div style={{ display: 'flex', fontSize: 66, fontWeight: 700, color: INK, lineHeight: 1.15 }}>
               {headline}
@@ -112,7 +104,7 @@ export default async function handler(req) {
         width: '100%', height: '100%', display: 'flex', flexDirection: 'column',
         justifyContent: 'space-between', background: INK, padding: '64px 72px',
       }}>
-        <Logo textColor={CREAM} />
+        <Logo textColor={CREAM} origin={origin} />
 
         <div style={{ display: 'flex', flexDirection: 'column' }}>
           <div style={{ display: 'flex', fontSize: 58, fontWeight: 700, color: CREAM, lineHeight: 1.2, maxWidth: 1000 }}>

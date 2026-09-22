@@ -242,7 +242,7 @@ export default function Admin() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+        <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
       </Head>
 
       <div className="dash-page">
@@ -285,13 +285,21 @@ export default function Admin() {
           <div className="admin-cards-row">
             <div className="admin-card">
               <h3 className="admin-card-title">⚠️ Churn risk ({adminData.churnRisk.length})</h3>
-              <p className="admin-card-sub">No activity in 7+ days</p>
+              <p className="admin-card-sub">No activity in 7+ days · sorted by real risk, not just silence</p>
               {adminData.churnRisk.length === 0 ? (
                 <p className="admin-card-empty">No users at risk right now.</p>
               ) : (
                 <div className="admin-churn-list">
                   {adminData.churnRisk.slice(0, 5).map(u => (
-                    <div key={u.user_id} className="admin-churn-row">{u.analysis?.name || u.url}</div>
+                    <div key={u.user_id} className="admin-churn-row">
+                      <div className="admin-churn-row-top">
+                        <span className="admin-churn-name">{u.name}</span>
+                        <span className={`admin-plan-badge admin-plan-${u.plan}`}>{u.plan}</span>
+                      </div>
+                      <div className="admin-churn-row-sub">
+                        {u.daysInactive}d inactive · {u.pushEnabled ? '🔔 push on' : '🔕 push off'}
+                      </div>
+                    </div>
                   ))}
                 </div>
               )}

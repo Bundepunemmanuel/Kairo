@@ -66,11 +66,38 @@ export default async function handler(req, res) {
         .gte('scanned_at', twentyFourHoursAgo)
 
       const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
-      const churnRisk = (allProfiles || []).filter(p => {
-        const settings = (settingsRows || []).find(s => s.user_id === p.user_id)
-        const lastActive = settings?.last_active_at || p.created_at
-        return new Date(lastActive) < new Date(sevenDaysAgo)
-      })
+      const { data: pushRows } = await supabaseAdmin.from('push_subscriptions').select('user_id')
+      const pushEnabledUserIds = new Set((pushRows || []).map(r => r.user_id))
+
+      const churnRisk = (allProfiles || [])
+        .filter(p => {
+          const settings = (settingsRows || []).find(s => s.user_id === p.user_id)
+          const lastActive = settings?.last_active_at || p.created_at
+          return new Date(lastActive) < new Date(sevenDaysAgo)
+        })
+        .map(p => {
+          const settings = (settingsRows || []).find(s => s.user_id === p.user_id)
+          const lastActive = settings?.last_active_at || p.created_at
+          const planRow = (allPlans || []).find(pl => pl.user_id === p.user_id)
+          const plan = planRow?.plan || 'free'
+          const pushEnabled = pushEnabledUserIds.has(p.user_id)
+          const daysInactive = Math.floor((Date.now() - new Date(lastActive).getTime()) / (24 * 60 * 60 * 1000))
+          return {
+            user_id: p.user_id,
+            url: p.url,
+            name: p.analysis?.name || p.url,
+            plan,
+            pushEnabled,
+            daysInactive,
+            // A paying user sitting quietly with push OFF is a real risk —
+            // nothing will bring them back. A paying user with push ON is
+            // just being served the way the product is designed to work
+            // (no reason to open the dashboard until there's a real lead),
+            // not actually at risk. Free users matter far less either way.
+            riskScore: (plan !== 'free' ? 2 : 0) + (!pushEnabled ? 1 : 0),
+          }
+        })
+        .sort((a, b) => b.riskScore - a.riskScore || b.daysInactive - a.daysInactive)
 
       const subredditCounts = {}
       ;(allProfiles || []).forEach(p => {

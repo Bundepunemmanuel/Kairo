@@ -5,6 +5,7 @@ import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
 import { useAuth } from './_app'
 import { pushIsSupported, needsHomeScreenInstructions, subscribeToPush } from '../lib/push'
+import ScoreGauge from '../components/ScoreGauge'
 
 const LOADING_STATES = [
   'Reading your product...',
@@ -526,7 +527,7 @@ export default function Onboarding() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+        <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
       </Head>
 
       <div className="ob-page">
@@ -607,10 +608,10 @@ export default function Onboarding() {
         {stage === 'loading' && (
           <div className="ob-stage">
             <div className="ob-loading-content">
-              <div className="loading-orb">
-                <div className="loading-orb-inner" />
-                <div className="loading-orb-ring" />
-                <div className="loading-orb-ring2" />
+              <div className="scan-grid">
+                {Array.from({ length: 9 }).map((_, i) => (
+                  <div key={i} className="scan-dot" style={{ animationDelay: `${i * 0.12}s` }} />
+                ))}
               </div>
               <p className="loading-text">{loadingMessage}</p>
               <div className="loading-dots">
@@ -809,7 +810,7 @@ export default function Onboarding() {
                           {lead.signalType === 'active' ? '🔴 Active Demand' : '🟡 Passive Demand'}
                         </span>
                         <span className="lead-subreddit">r/{lead.subreddit}</span>
-                        <span className="lead-score">Score: {Number(lead.score).toFixed(1)}</span>
+                        <ScoreGauge score={lead.score} />
                         {isCommentLead && (
                           <span className="comment-lead-badge">💬 Signal in comments</span>
                         )}
@@ -896,7 +897,7 @@ export default function Onboarding() {
                       <div className="close-match-top">
                         <span className="close-match-badge">Close match</span>
                         <span className="lead-subreddit">r/{lead.subreddit}</span>
-                        <span className="lead-score">Score: {Number(lead.score).toFixed(1)}</span>
+                        <ScoreGauge score={lead.score} />
                       </div>
                       <h4 className="close-match-title">{lead.title}</h4>
                       {lead.body && (

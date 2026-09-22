@@ -4,6 +4,7 @@ import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
 import { useAuth } from './_app'
+import ScoreGauge from '../components/ScoreGauge'
 
 const PLAN_LABELS = { free: 'Free', starter: 'Starter', pro: 'Pro', unlimited: 'Unlimited' }
 const ADMIN_EMAIL = 'bundepunemmanuel@gmail.com'
@@ -220,7 +221,7 @@ export default function Archive() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+        <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
       </Head>
 
       <div className="dash-page">
@@ -336,7 +337,7 @@ export default function Archive() {
                 <div key={lead.id} className="archive-card">
                   <div className="archive-card-meta">
                     <span className="dash-lead-sub">r/{lead.subreddit}</span>
-                    <span className="dash-lead-score">Score: {Number(lead.score).toFixed(1)}</span>
+                    <ScoreGauge score={lead.score} />
                     <span className="archive-card-date">{formatDate(lead.scanned_at)}</span>
                   </div>
                   <p className="archive-card-title">{lead.title}</p>

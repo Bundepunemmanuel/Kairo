@@ -4,6 +4,7 @@ import Head from 'next/head'
 import { supabase } from '../../lib/supabase'
 import { pushIsSupported, needsHomeScreenInstructions, subscribeToPush } from '../../lib/push'
 import { getShareByToken } from '../../lib/getShareData'
+import ScoreGauge from '../../components/ScoreGauge'
 
 // ─── Reddit parsing — duplicated from onboarding.js rather than shared,
 // matching this codebase's existing pattern of per-page helpers (e.g.
@@ -301,7 +302,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
                       {lead.signalType === 'active' ? '🔴 Active Demand' : '🟡 Passive Demand'}
                     </span>
                     <span className="lead-subreddit">r/{lead.subreddit}</span>
-                    <span className="lead-score">Score: {Number(lead.score).toFixed(1)}</span>
+                    <ScoreGauge score={lead.score} />
                   </div>
                 </div>
 
@@ -353,7 +354,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
                     <div className="close-match-top">
                       <span className="close-match-badge">Close match</span>
                       <span className="lead-subreddit">r/{lead.subreddit}</span>
-                      <span className="lead-score">Score: {Number(lead.score).toFixed(1)}</span>
+                      <ScoreGauge score={lead.score} />
                     </div>
                     <h4 className="close-match-title">{lead.title}</h4>
                     {lead.body && (
