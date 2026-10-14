@@ -47,6 +47,38 @@ export default function Debug() {
   const [result, setResult] = useState(null)
   const [error, setError] = useState('')
 
+  // ── Reddit direct-fetch test ──────────────────────────────────────────
+  // Checks whether the BROWSER can call Reddit directly, bypassing our own
+  // /api/reddit.js proxy entirely. If this works, every visitor's own IP
+  // could be used instead of Vercel's shared (and currently rate-limited)
+  // server IP. If it's blocked, the browser's CORS policy is stopping it
+  // before the request ever reaches Reddit — not a Reddit rate-limit at
+  // all, a completely different kind of block.
+  const [redditTestState, setRedditTestState] = useState('idle') // idle | testing | success | blocked
+  const [redditTestDetail, setRedditTestDetail] = useState('')
+
+  const testRedditDirect = async () => {
+    setRedditTestState('testing')
+    setRedditTestDetail('')
+    try {
+      const res = await fetch(
+        'https://www.reddit.com/r/SaaS/search.rss?q=test&restrict_sr=1&sort=new&t=week&limit=5',
+        { signal: AbortSignal.timeout(10000) }
+      )
+      const text = await res.text()
+      if (text.includes('<entry>') || text.includes('<feed')) {
+        setRedditTestState('success')
+        setRedditTestDetail(`Status ${res.status} — got real feed data back (${text.length} chars). Direct browser fetch works.`)
+      } else {
+        setRedditTestState('blocked')
+        setRedditTestDetail(`Status ${res.status} — request completed but response doesn't look like a real feed. First 200 chars: ${text.slice(0, 200)}`)
+      }
+    } catch (e) {
+      setRedditTestState('blocked')
+      setRedditTestDetail(`${e.name}: ${e.message} — this is almost always a CORS block, meaning the browser refused to even send the request.`)
+    }
+  }
+
   const run = async () => {
     setLoading(true)
     setResult(null)
@@ -82,6 +114,30 @@ export default function Debug() {
   return (
     <div style={{ fontFamily: 'monospace', padding: 20, maxWidth: 900, margin: '0 auto', fontSize: 13 }}>
       <h1 style={{ fontSize: 18, marginBottom: 16 }}>🔍 Kairo Debug Scanner</h1>
+
+      <section style={{ marginBottom: 24, background: '#f5f5f5', padding: 12, borderRadius: 8 }}>
+        <h2 style={{ fontSize: 14, marginBottom: 8 }}>🌐 Test Reddit Connection</h2>
+        <p style={{ color: '#666', marginBottom: 10 }}>
+          Fetches Reddit directly from your browser, skipping /api/reddit.js entirely — checks whether this device's own IP could be used instead of Vercel's shared server IP.
+        </p>
+        <button
+          onClick={testRedditDirect}
+          disabled={redditTestState === 'testing'}
+          style={{ padding: '8px 16px', background: '#1a1208', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer', marginBottom: 10 }}
+        >
+          {redditTestState === 'testing' ? 'Testing...' : 'Test Reddit Connection'}
+        </button>
+        {redditTestState === 'success' && (
+          <div style={{ color: '#2e7d32', background: '#e8f5e9', padding: 10, borderRadius: 6 }}>
+            ✅ Success — {redditTestDetail}
+          </div>
+        )}
+        {redditTestState === 'blocked' && (
+          <div style={{ color: '#c62828', background: '#ffebee', padding: 10, borderRadius: 6 }}>
+            ❌ Blocked — {redditTestDetail}
+          </div>
+        )}
+      </section>
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
         <input value={url} onChange={e => setUrl(e.target.value)} placeholder="notion.so" style={{ flex: 1, padding: '8px 12px', border: '1px solid #ccc', borderRadius: 6, fontSize: 13 }} onKeyDown={e => e.key === 'Enter' && run()} />

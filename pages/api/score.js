@@ -45,6 +45,7 @@ async function groq(messages, maxTokens, temperature, model = 'openai/gpt-oss-12
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature, reasoning_effort: 'low' }),
+      signal: AbortSignal.timeout(20000),
     })
     const data = await res.json()
     if (data.error) {
@@ -116,6 +117,7 @@ async function gemini(messages, maxTokens, temperature, _isRetry = false) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GEMINI_API_KEY}` },
       body: JSON.stringify({ model: 'gemini-3.5-flash-lite', messages, max_tokens: maxTokens, temperature }),
+      signal: AbortSignal.timeout(20000),
     })
 
     if (res.status === 429 && !_isRetry) {
@@ -162,12 +164,39 @@ function parseJSON(raw) {
 // scoredUrls is every post actually sent to an AI — used by cron-scan to
 // mark them in seen_posts so they're never re-scored, whether they
 // qualified as a lead or not.
+// Interleaves posts round-robin by subreddit (r1-s1, r1-s2, r1-s3, r2-s1,
+// ...) instead of leaving them in whatever order they arrived. Moved here
+// from being each caller's own responsibility — cron-scan did its own
+// round-robin before calling this, but onboarding.js and share/[token].js
+// never did, meaning their first N posts were silently biased toward
+// whichever subreddit's request happened to land first. Doing it once,
+// centrally, guarantees every caller gets a fair sample regardless of
+// whether they remembered to interleave upstream.
+function interleaveBySubreddit(posts) {
+  const bySubreddit = new Map()
+  for (const p of posts) {
+    const key = p.subreddit || ''
+    if (!bySubreddit.has(key)) bySubreddit.set(key, [])
+    bySubreddit.get(key).push(p)
+  }
+  const buckets = [...bySubreddit.values()]
+  const result = []
+  for (let i = 0; result.length < posts.length; i++) {
+    for (const bucket of buckets) if (bucket[i]) result.push(bucket[i])
+  }
+  return result
+}
+
 async function scorePosts(posts, analysis) {
-  // Take first 40 posts — safely within budget for either provider.
-  // Posts arrive already round-robin'd across subreddits from cron-scan,
-  // so this sample is spread fairly rather than dominated by whichever
-  // subreddit was fetched first.
-  const sample = posts.slice(0, 40)
+  // Raised from 40 — paired with proportional max_tokens increases on
+  // every provider's call below (see gemini/groq/gptOss20b), so a bigger
+  // sample doesn't risk truncating mid-response the way a cap raised
+  // without a matching token bump would (the exact failure mode that
+  // broke JSON parsing once before — see score.js's parse-failure
+  // handling). Fairness now comes from interleaveBySubreddit regardless of
+  // what order posts arrived in, not from trusting the caller to have
+  // already done it.
+  const sample = interleaveBySubreddit(posts).slice(0, 60)
   const scoredUrls = sample.map(p => p.url).filter(Boolean)
 
   const input = sample.map((p, i) => ({
@@ -231,17 +260,21 @@ Posts: ${JSON.stringify(input)}`,
   // own outages, so it gets tried while there's still real time budget
   // left, and Groq — the one actually prone to running dry — is now the
   // true last resort instead of a wasted middle step.
+  // Raised proportionally to the sample-size increase (40→60 posts, ~1.5x)
+  // on all three providers — a cap raised without matching headroom risks
+  // the response getting cut off mid-JSON, which breaks parsing entirely
+  // rather than just scoring fewer posts.
   console.log('[score] trying Gemini (primary)')
-  let raw = await gemini(messages, 4000, 0.1)
+  let raw = await gemini(messages, 6000, 0.1)
 
   if (!raw) {
     console.log('[score] Gemini empty — falling back to gpt-oss-20b')
-    raw = await gptOss20b(messages, 2500, 0.1)
+    raw = await gptOss20b(messages, 3800, 0.1)
   }
 
   if (!raw) {
     console.log('[score] gpt-oss-20b empty — falling back to Groq (final)')
-    raw = await groq(messages, 1500, 0.1)
+    raw = await groq(messages, 2300, 0.1)
   }
 
   console.log(`[score] raw (150): ${raw.slice(0, 150)}`)

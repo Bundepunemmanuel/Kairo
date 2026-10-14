@@ -1,15 +1,16 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import Head from 'next/head'
 import { supabase } from '../../lib/supabase'
 import { pushIsSupported, needsHomeScreenInstructions, subscribeToPush } from '../../lib/push'
 import { getShareByToken } from '../../lib/getShareData'
 import ScoreGauge from '../../components/ScoreGauge'
+import { track } from '../_app'
 
 // ─── Reddit parsing — duplicated from onboarding.js rather than shared,
 // matching this codebase's existing pattern of per-page helpers (e.g.
 // KairoLogo) over a shared lib for anything view-adjacent. ───────────────
-function parseAtom(xml, subreddit) {
+function parseAtom(xml, defaultSubreddit) {
   const posts = []
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)]
   for (const m of entries) {
@@ -17,6 +18,11 @@ function parseAtom(xml, subreddit) {
     const title = (entry.match(/<title[^>]*>([\s\S]*?)<\/title>/) || [])[1]
       ?.replace(/<!\[CDATA\[|\]\]>/g, '')?.trim() ?? ''
     const link = (entry.match(/<link[^>]*href="([^"]+)"/) || [])[1]?.trim() ?? ''
+    // Each entry carries its own subreddit via <category term="...">,
+    // which matters now that one request can combine several subreddits
+    // (multireddit batching). Falls back to defaultSubreddit only if the
+    // tag is ever missing.
+    const subreddit = (entry.match(/<category term="([^"]+)"/) || [])[1] || defaultSubreddit
     const rawContent = (entry.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1] || ''
     const content = rawContent
       .replace(/<!\[CDATA\[|\]\]>/g, '')
@@ -44,32 +50,60 @@ function parseAtom(xml, subreddit) {
   return posts
 }
 
-async function fetchSubredditFromBrowser(subreddit) {
+// `subs` may be a single subreddit or several joined with "+" — see
+// onboarding.js for the full reasoning (encodeURIComponent → %2B → decodes
+// back to a literal "+" on our own /api/reddit, which reddit.js then
+// re-splits for the outbound Reddit request).
+async function fetchSubredditFromBrowser(subs, keywords) {
   try {
-    const res = await fetch(`/api/reddit?sub=${encodeURIComponent(subreddit)}&sort=new`, { signal: AbortSignal.timeout(10000) })
+    const kw = Array.isArray(keywords) && keywords.length ? `&keywords=${encodeURIComponent(keywords.join(','))}` : ''
+    const res = await fetch(`/api/reddit?sub=${encodeURIComponent(subs)}&sort=new${kw}`, { signal: AbortSignal.timeout(10000) })
     if (!res.ok) return []
     const xml = await res.text()
     if (!xml.includes('<entry>')) return []
-    return parseAtom(xml, subreddit)
+    return parseAtom(xml, subs)
   } catch {
     return []
   }
 }
 
-async function fetchCommentsFromBrowser(subreddit, postId) {
-  try {
-    const res = await fetch(`/api/reddit?mode=comments&sub=${encodeURIComponent(subreddit)}&postId=${encodeURIComponent(postId)}`, { signal: AbortSignal.timeout(8000) })
-    if (!res.ok) return []
-    const data = await res.json()
-    return data.comments || []
-  } catch {
-    return []
+// Fetches sequentially with a gap between each — see onboarding.js for
+// the full reasoning. Shrunk from 400ms now that /api/reddit.js routes
+// through a Cloudflare Worker instead of hitting Reddit directly from
+// Vercel's (previously rate-limited) IP.
+async function staggeredMap(items, fn, delayMs = 150) {
+  const results = []
+  for (let i = 0; i < items.length; i++) {
+    results.push(await fn(items[i], i))
+    if (i < items.length - 1) await new Promise(r => setTimeout(r, delayMs))
   }
+  return results
+}
+
+// Splits subreddits into groups — raised from 3 to 6 (one request per
+// scan instead of two) — see onboarding.js's chunkSubreddits for the full
+// reasoning (production logs showed Reddit's quota hitting 0.0 after a
+// single request, so the second request was always doomed).
+function chunkSubreddits(subs, groupSize = 6) {
+  const groups = []
+  for (let i = 0; i < subs.length; i += groupSize) groups.push(subs.slice(i, i + groupSize).join('+'))
+  return groups
 }
 
 const isValidUrl = str => {
   try { new URL(str.startsWith('http') ? str : `https://${str}`); return true }
   catch { return false }
+}
+
+// Reply windows mirror score.js (active demand 3h, passive 6h, counted from
+// when the post went up) and the same copy in pages/api/og.js — keep all
+// three in sync. Only used to decide whether the link-preview caption may
+// carry urgency copy: with the 7-day search window, many leads are already
+// past their window, so "go cold in hours" must not imply those are fresh.
+const windowMinutes = lead => (lead.signalType === 'active' ? 180 : 360)
+const isInsideWindow = lead => {
+  if (!lead.createdAt) return false
+  return (Date.now() - lead.createdAt) / 60000 < windowMinutes(lead)
 }
 
 // SSR, not client fetch — the only page in this app that needs it. Link
@@ -94,6 +128,10 @@ export default function SharePage({ token, initialStatus, initialData }) {
   const [notifyError, setNotifyError] = useState('')
   const [notifyExisting, setNotifyExisting] = useState(false)
 
+  useEffect(() => {
+    track('share_page_viewed', { status })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const handleCopy = (id, text) => {
     navigator.clipboard.writeText(text)
@@ -115,6 +153,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
     }
 
     setNotifyStage('scanning')
+    track('share_notify_submitted')
     try {
       // ── Same analyze → Reddit → score pipeline as onboarding.js's free
       // scan, run for their product this time, not the one being shared.
@@ -129,7 +168,10 @@ export default function SharePage({ token, initialStatus, initialData }) {
       const productAnalysis = analyzeData.analysis
 
       const subreddits = (productAnalysis.subreddits || ['SaaS', 'indiehackers', 'entrepreneur']).slice(0, 6)
-      const postArrays = await Promise.all(subreddits.map(fetchSubredditFromBrowser))
+      const subredditGroups = chunkSubreddits(subreddits)
+      const postArrays = await staggeredMap(
+        subredditGroups, group => fetchSubredditFromBrowser(group, productAnalysis.problemKeywords)
+      )
       const allPosts = postArrays.flat().filter(p =>
         p.body && p.body.length > 40 &&
         !p.body.includes('submitted by') && !p.body.includes('[link]') && !p.body.includes('[comments]')
@@ -137,19 +179,32 @@ export default function SharePage({ token, initialStatus, initialData }) {
 
       let scoredLeads = []
       if (allPosts.length) {
-        const commentsMap = {}
-        await Promise.allSettled(allPosts.map(async post => {
-          const comments = await fetchCommentsFromBrowser(post.subreddit, post.id)
-          if (comments.length) commentsMap[post.id] = comments
-        }))
+        // Comment-fetching used to happen here, but score.js never read it
+        // and the comments endpoint gets Reddit's explicit anti-bot block
+        // page every time now — removed, same as onboarding.js.
         const scoreRes = await fetch('/api/score', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ posts: allPosts, analysis: productAnalysis, commentsMap, includeCloseMatches: true }),
+          body: JSON.stringify({ posts: allPosts, analysis: productAnalysis, includeCloseMatches: true }),
         })
         const scoreData = await scoreRes.json()
         if (scoreData.error) throw new Error(scoreData.error)
         scoredLeads = scoreData.leads || []
+      }
+
+      // Same public homepage ticker as the main onboarding scan — this is
+      // just as much "someone scanned their product" as that flow is.
+      const qualifiedForFeed = scoredLeads.filter(l => l.tier !== 'close')
+      if (qualifiedForFeed.length > 0) {
+        fetch('/api/log-scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            productName: productAnalysis.name,
+            leadCount: qualifiedForFeed.length,
+            topScore: Math.max(...qualifiedForFeed.map(l => l.score || 0)),
+          }),
+        }).catch(() => {})
       }
 
       // Push subscription is best-effort — a denial or an iOS visitor who
@@ -179,6 +234,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
           refresh_token: captureData.session.refresh_token,
         })
       }
+      track('share_notify_completed', { existingAccount: !!captureData.existingAccount })
       setNotifyStage('done')
     } catch (e) {
       console.log('[share] notify-me error:', e.message)
@@ -237,13 +293,21 @@ export default function SharePage({ token, initialStatus, initialData }) {
   const qualified = leads.filter(l => l.tier !== 'close')
   const closeMatches = leads.filter(l => l.tier === 'close')
 
+  // This is what X draws over the bottom-left of the preview image, so it
+  // carries the same hook as the image itself. Falls back to the plain
+  // caption when a share has no qualified leads (the image falls back too).
+  const shareCount = qualified.length
+  const cardCaption = shareCount > 0
+    ? `${analysis.name} — ${shareCount} ${shareCount === 1 ? 'person' : 'people'} on Reddit ${shareCount === 1 ? 'needs' : 'need'} this.${qualified.some(isInsideWindow) ? ' Leads go cold in hours.' : ''}`
+    : `${analysis.name} — Leads found by Kairo`
+
   return (
     <>
       <Head>
         <title>{analysis.name} — Leads found by Kairo</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="robots" content="noindex" />
-        <meta property="og:title" content={`${qualified.length > 0 ? `${qualified.length} qualified leads found` : 'Leads found'} for ${analysis.name}`} />
+        <meta property="og:title" content={cardCaption} />
         <meta property="og:description" content="Kairo scans Reddit and finds people already asking for solutions like yours." />
         <meta property="og:type" content="website" />
         <meta property="og:url" content={`https://kairo-omega.vercel.app/share/${token}`} />
@@ -251,7 +315,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
         <meta property="og:image:width" content="1200" />
         <meta property="og:image:height" content="630" />
         <meta name="twitter:card" content="summary_large_image" />
-        <meta name="twitter:title" content={`${analysis.name} — Leads found by Kairo`} />
+        <meta name="twitter:title" content={cardCaption} />
         <meta name="twitter:image" content={`https://kairo-omega.vercel.app/api/og?token=${token}`} />
       </Head>
 
@@ -435,7 +499,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
                   <button
                     className="lead-btn-secondary"
                     style={{ width: '100%', textAlign: 'center' }}
-                    onClick={() => setNotifyOpen(true)}
+                    onClick={() => { setNotifyOpen(true); track('share_notify_opened') }}
                   >
                     Just tell us where to send them
                   </button>

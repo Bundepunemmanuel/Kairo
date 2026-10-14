@@ -1,5 +1,26 @@
 // reddit.js — Proxy for Reddit RSS feeds, post comment JSON, and subreddit rules
 // Handles subreddit feeds, per-post comment fetching, and rules lookup
+//
+// TEMPORARY DIAGNOSTIC BUILD — this is the exact production file with
+// logging added and nothing else changed. No batching, no proxy, no
+// limit/header/fallback changes. The only difference from the live
+// production file is every console.log call below. Deployed to preview
+// specifically to test whether 429s are about the environment (preview vs
+// production) with every other variable held constant.
+
+// Logs whatever rate-limit-related headers Reddit sends — on every
+// response, not just 429s. Previously only logged on failure, which meant
+// we only ever saw the quota at the moment it hit zero, never counting
+// down. Logging it on success too lets us watch X-Ratelimit-Remaining
+// actually decrease request to request, and see what X-Ratelimit-Reset
+// says before anything has failed — the only way to map out the real
+// window size and budget instead of inferring it after the fact.
+function logRateLimitHeaders(tag, response) {
+  const retryAfter = response.headers.get('retry-after')
+  const remaining = response.headers.get('x-ratelimit-remaining')
+  const reset = response.headers.get('x-ratelimit-reset')
+  console.log(`${tag} status ${response.status} — Retry-After: ${retryAfter ?? 'none'}, X-Ratelimit-Remaining: ${remaining ?? 'none'}, X-Ratelimit-Reset: ${reset ?? 'none'}`)
+}
 
 export default async function handler(req, res) {
   const { sub, sort = 'new', mode, postId } = req.query
@@ -36,17 +57,31 @@ async function fetchSubredditFeed(req, res, sub, sort) {
         }
       )
 
-      const text = await response.text()
-      if (!text.includes('<entry>')) continue
+      // Logging only — status checked for visibility, fallback behavior
+      // below is completely unchanged (still cascades through every tier
+      // regardless of why the previous one failed, exactly as production
+      // does today). Logged on every response now, not just 429s, so the
+      // quota can be watched counting down rather than only seen at zero.
+      logRateLimitHeaders(`[reddit:${s}]`, response)
 
+      const text = await response.text()
+      if (!text.includes('<entry>')) {
+        console.log(`[reddit:${s}] r/${sub} empty result (status ${response.status})`)
+        continue
+      }
+
+      const count = (text.match(/<entry>/g) || []).length
+      console.log(`[reddit:${s}] r/${sub} success — ${count} entries`)
       res.setHeader('Content-Type', 'text/xml; charset=utf-8')
       res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate')
       return res.status(200).send(text)
-    } catch {
+    } catch (e) {
+      console.log(`[reddit:${s}] r/${sub} fetch error: ${e.message}`)
       continue
     }
   }
 
+  console.log(`[reddit] r/${sub} — all sources exhausted, returning empty feed`)
   return res.status(200).send('<feed></feed>')
 }
 
@@ -82,6 +117,10 @@ async function fetchRules(req, res, sub) {
       combinedText += ' ' + (aboutData?.data?.public_description || '') + ' ' + (aboutData?.data?.description || '')
     }
 
+    console.log(`[reddit:rules] r/${sub} rules status ${rulesRes?.status ?? 'fetch_failed'}, about status ${aboutRes?.status ?? 'fetch_failed'}`)
+    if (rulesRes) logRateLimitHeaders('[reddit:rules]', rulesRes)
+    if (aboutRes) logRateLimitHeaders('[reddit:about]', aboutRes)
+
     res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate')
     // Return status codes alongside the text — cron-scan logs these, so a
     // future silent failure shows real evidence (which call failed and
@@ -108,7 +147,12 @@ async function fetchComments(req, res, sub, postId) {
       }
     )
 
-    if (!response.ok) return res.status(200).json({ comments: [] })
+    logRateLimitHeaders('[reddit:comments]', response)
+
+    if (!response.ok) {
+      console.log(`[reddit:comments] r/${sub}/${postId} failed (status ${response.status})`)
+      return res.status(200).json({ comments: [] })
+    }
 
     const data = await response.json()
 

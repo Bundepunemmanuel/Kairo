@@ -3,6 +3,9 @@ import Link from 'next/link'
 import Head from 'next/head'
 import Nav, { KairoLogo } from '../components/Nav'
 import Footer from '../components/Footer'
+import ScanTicker from '../components/ScanTicker'
+import DesktopMockup from '../components/DesktopMockup'
+import { track } from './_app'
 
 const STATS = [
   { value: '2 min', label: 'To your first lead' },
@@ -85,7 +88,7 @@ export default function Home() {
       <Nav />
 
       {/* Hero */}
-      <div className="hero">
+      <div className="hero hero-centered">
         <div className="hero-content">
           <div className="hero-badge">
             <span className="badge-dot" />
@@ -100,7 +103,7 @@ export default function Home() {
             Your next 10 customers are on Reddit right now — frustrated, asking for recommendations, ready to buy. Kairo finds them, scores their intent, and writes your reply. Before your competitor does.
           </p>
           <div className="hero-ctas">
-            <Link href="/onboarding" className="btn-primary">Find My First Customer →</Link>
+            <Link href="/onboarding" className="btn-primary" onClick={() => track('hero_cta_clicked', { source: 'hero' })}>Find My First Customer →</Link>
             <a href="#how-it-works" className="btn-ghost">See how it works</a>
           </div>
           <div className="hero-proof">
@@ -108,18 +111,13 @@ export default function Home() {
             <span>No credit card · Results in 2 minutes · Free to start</span>
           </div>
         </div>
-
-        {/* Phone */}
-        <div className="hero-phone">
-          <div className="phone-float">
-            <img
-              src="/mockup.webp"
-              alt="Kairo dashboard showing real Reddit leads sorted by intent score, with one-click draft replies"
-              className="hero-mockup-img"
-            />
-          </div>
-        </div>
       </div>
+
+      <div className="hero-mockup-section">
+        <DesktopMockup />
+      </div>
+
+      <ScanTicker />
 
       {/* Stats */}
       <div className="stats-bar">
@@ -244,7 +242,7 @@ export default function Home() {
         <div className="final-cta-inner">
           <h2 className="final-cta-headline">Your next customer<br /><em>posted 2 hours ago.</em></h2>
           <p className="final-cta-sub">They're still waiting for a reply. Kairo already found them.</p>
-          <Link href="/onboarding" className="btn-primary">Find My First Customer →</Link>
+          <Link href="/onboarding" className="btn-primary" onClick={() => track('hero_cta_clicked', { source: 'bottom' })}>Find My First Customer →</Link>
         </div>
       </div>
 

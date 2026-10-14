@@ -20,6 +20,7 @@ async function groqReply(messages) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({ model: 'openai/gpt-oss-120b', messages, max_tokens: 500, temperature: 0.75, reasoning_effort: 'low' }),
+      signal: AbortSignal.timeout(20000),
     })
     const data = await res.json()
     if (data.error) { console.log('[reply:groq] error:', data.error.message); return '' }
@@ -54,6 +55,7 @@ async function geminiReply(messages, _isRetry = false) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GEMINI_API_KEY}` },
       body: JSON.stringify({ model: 'gemini-3.5-flash-lite', messages, max_tokens: 500, temperature: 0.75 }),
+      signal: AbortSignal.timeout(20000),
     })
     const data = await res.json()
     if (data.error) { console.log('[reply:gemini] error:', data.error.message); return '' }
@@ -119,6 +121,7 @@ async function nemotronReply(messages) {
         temperature: 0.75,
         reasoning: { exclude: true }, // ask OpenRouter to keep reasoning out of content
       }),
+      signal: AbortSignal.timeout(20000),
     })
     const data = await res.json()
     if (data.error) { console.log('[reply:nemotron] error:', data.error.message); return '' }

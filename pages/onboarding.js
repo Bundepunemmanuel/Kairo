@@ -3,7 +3,7 @@ import Link from 'next/link'
 import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
-import { useAuth } from './_app'
+import { useAuth, track } from './_app'
 import { pushIsSupported, needsHomeScreenInstructions, subscribeToPush } from '../lib/push'
 import ScoreGauge from '../components/ScoreGauge'
 
@@ -19,7 +19,7 @@ const LOADING_STATES = [
 
 // ─── Reddit parsing ────────────────────────────────────────────────────────
 
-function parseAtom(xml, subreddit) {
+function parseAtom(xml, defaultSubreddit) {
   const posts = []
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)]
   for (const m of entries) {
@@ -27,6 +27,12 @@ function parseAtom(xml, subreddit) {
     const title = (entry.match(/<title[^>]*>([\s\S]*?)<\/title>/) || [])[1]
       ?.replace(/<!\[CDATA\[|\]\]>/g, '')?.trim() ?? ''
     const link = (entry.match(/<link[^>]*href="([^"]+)"/) || [])[1]?.trim() ?? ''
+    // Each entry carries its own subreddit via <category term="...">,
+    // which matters now that one request can combine several subreddits
+    // (multireddit batching) — a single defaultSubreddit would be wrong
+    // for most posts in that case. Falls back to defaultSubreddit only if
+    // the tag is ever missing (shouldn't happen, but better than a blank).
+    const subreddit = (entry.match(/<category term="([^"]+)"/) || [])[1] || defaultSubreddit
     const rawContent = (entry.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1] || ''
     const content = rawContent
       .replace(/<!\[CDATA\[|\]\]>/g, '')
@@ -39,7 +45,7 @@ function parseAtom(xml, subreddit) {
     const published = (entry.match(/<published>([\s\S]*?)<\/published>/) || [])[1] || ''
     if (!title || !link.includes('/comments/')) continue
 
-    // Extract post ID from URL for comment fetching
+    // Extract post ID from URL — used as the lead's id throughout the app
     const urlParts = link.split('/')
     const commentsIdx = urlParts.indexOf('comments')
     const postId = commentsIdx !== -1 ? urlParts[commentsIdx + 1] : urlParts.filter(Boolean).pop()
@@ -57,34 +63,60 @@ function parseAtom(xml, subreddit) {
   return posts
 }
 
-async function fetchSubredditFromBrowser(subreddit) {
+// `subs` may be a single subreddit name or several joined with "+" (a
+// Reddit multireddit) — encodeURIComponent turns "+" into "%2B", which
+// survives the round trip to our own /api/reddit and decodes back to a
+// literal "+" there, which reddit.js then re-splits for the outbound
+// Reddit request. parseAtom no longer needs this value for tagging each
+// post's subreddit (each entry carries its own via <category> now) — it's
+// only kept as a last-resort fallback if that tag is ever missing.
+async function fetchSubredditFromBrowser(subs, keywords) {
   try {
+    const kw = Array.isArray(keywords) && keywords.length ? `&keywords=${encodeURIComponent(keywords.join(','))}` : ''
     const res = await fetch(
-      `/api/reddit?sub=${encodeURIComponent(subreddit)}&sort=new`,
+      `/api/reddit?sub=${encodeURIComponent(subs)}&sort=new${kw}`,
       { signal: AbortSignal.timeout(10000) }
     )
     if (!res.ok) return []
     const xml = await res.text()
     if (!xml.includes('<entry>')) return []
-    return parseAtom(xml, subreddit)
+    return parseAtom(xml, subs)
   } catch {
     return []
   }
 }
 
-// Fetch comments for a specific post
-async function fetchCommentsFromBrowser(subreddit, postId) {
-  try {
-    const res = await fetch(
-      `/api/reddit?mode=comments&sub=${encodeURIComponent(subreddit)}&postId=${encodeURIComponent(postId)}`,
-      { signal: AbortSignal.timeout(8000) }
-    )
-    if (!res.ok) return []
-    const data = await res.json()
-    return data.comments || []
-  } catch {
-    return []
+// Splits subreddits into groups — each group becomes one combined
+// multireddit request. Was groupSize 3 (6 subreddits → 2 requests), raised
+// to 6 (→ 1 request) after production logs showed the real cause of the
+// 429s: Reddit's X-Ratelimit-Remaining hit 0.0 after a single request, so
+// it was always the *second* request in a scan that failed, every time —
+// not a volume/reputation issue. One request per scan means that failure
+// mode can't happen. The tradeoff this gives up: an uneven split across
+// very different subreddits isn't guaranteed (Reddit returns top-N by sort
+// order across the merged set, not an even share per subreddit), and a
+// single blocked request now loses the whole scan's data with no partial
+// fallback — acceptable since the alternative (2 requests) was reliably
+// losing half the data anyway.
+function chunkSubreddits(subs, groupSize = 6) {
+  const groups = []
+  for (let i = 0; i < subs.length; i += groupSize) groups.push(subs.slice(i, i + groupSize).join('+'))
+  return groups
+}
+
+// Fetches sequentially with a gap between each, instead of firing every
+// subreddit at once via Promise.all. Originally sized (400ms) for when
+// requests went direct to Reddit from Vercel's IP and got reliably
+// rate-limited; now that /api/reddit.js routes through a Cloudflare Worker
+// instead, shrunk but kept rather than removed — no need to re-test that
+// boundary aggressively on day one of a brand-new proxy.
+async function staggeredMap(items, fn, delayMs = 150) {
+  const results = []
+  for (let i = 0; i < items.length; i++) {
+    results.push(await fn(items[i], i))
+    if (i < items.length - 1) await new Promise(r => setTimeout(r, delayMs))
   }
+  return results
 }
 
 // ─── Component ────────────────────────────────────────────────────────────
@@ -266,6 +298,7 @@ export default function Onboarding() {
     setStage('loading')
     setLoadingIndex(0)
     setLoadingMessage(LOADING_STATES[0])
+    track('scan_started', { url: clean })
 
     try {
       // ── Step 1: Analyze product — extract specific problems, not just audience
@@ -293,8 +326,14 @@ export default function Onboarding() {
       setAnalysis(productAnalysis)
 
       // ── Step 2: Fetch Reddit posts from browser (avoids server-side blocking)
+      // problemKeywords (from analyze.js) bounds this to the last 7 days via
+      // Reddit's search endpoint instead of whatever happens to be newest
+      // right now — see /api/reddit.js for the fallback if search is empty.
       const subreddits = (productAnalysis.subreddits || ['SaaS', 'indiehackers', 'entrepreneur']).slice(0, 6)
-      const postArrays = await Promise.all(subreddits.map(fetchSubredditFromBrowser))
+      const subredditGroups = chunkSubreddits(subreddits)
+      const postArrays = await staggeredMap(
+        subredditGroups, group => fetchSubredditFromBrowser(group, productAnalysis.problemKeywords)
+      )
       const allPosts = postArrays.flat().filter(p =>
         p.body &&
         p.body.length > 40 &&
@@ -312,22 +351,15 @@ export default function Onboarding() {
         return
       }
 
-      // ── Step 3: Fetch comments for each post (in parallel, best-effort)
-      // We fetch comments for ALL posts so score.js can find comment-level signals
-      const commentsMap = {}
-      const commentFetches = allPosts.map(async post => {
-        const comments = await fetchCommentsFromBrowser(post.subreddit, post.id)
-        if (comments.length > 0) {
-          commentsMap[post.id] = comments
-        }
-      })
-      await Promise.allSettled(commentFetches) // Never block on comment failures
-
-      // ── Step 4: Score posts + comments, generate replies
+      // ── Step 3: Score posts, generate replies
+      // Comment-fetching used to happen here, but score.js never read it
+      // (confirmed directly — commentsMap wasn't in its req.body
+      // destructuring) and the comments endpoint gets Reddit's explicit
+      // anti-bot block page 100% of the time. Pure dead weight, removed.
       const scoreRes = await fetch('/api/score', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ posts: allPosts, analysis: productAnalysis, commentsMap, includeCloseMatches: true }),
+        body: JSON.stringify({ posts: allPosts, analysis: productAnalysis, includeCloseMatches: true }),
       })
 
       const { leads: scoredLeads, error: scoreError } = await scoreRes.json()
@@ -337,6 +369,30 @@ export default function Onboarding() {
       localStorage.setItem('kairo_scan_used', '1')
       setLeads(scoredLeads || [])
       setStage('results')
+
+      const qualifiedForFeed = (scoredLeads || []).filter(l => l.tier !== 'close')
+      const closeForFeed = (scoredLeads || []).filter(l => l.tier === 'close')
+      track('scan_completed', {
+        leadCount: (scoredLeads || []).length,
+        qualifiedCount: qualifiedForFeed.length,
+        closeMatchCount: closeForFeed.length,
+      })
+      if (qualifiedForFeed.length === 0) track('zero_results_shown')
+
+      // Public homepage ticker — every scan that found something, not just
+      // ones tied to an account. Fire-and-forget: never blocks or delays
+      // showing results to the person who just scanned.
+      if (qualifiedForFeed.length > 0) {
+        fetch('/api/log-scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            productName: productAnalysis.name,
+            leadCount: qualifiedForFeed.length,
+            topScore: Math.max(...qualifiedForFeed.map(l => l.score || 0)),
+          }),
+        }).catch(() => {})
+      }
 
       // Save product profile and leads to database if user is logged in
       if (user) {
@@ -430,6 +486,7 @@ export default function Onboarding() {
       setCaptureError('Please enter a valid email')
       return
     }
+    track('notify_me_submitted')
 
     setCapturing(true)
     let subscription = null
@@ -473,6 +530,7 @@ export default function Onboarding() {
           refresh_token: data.session.refresh_token,
         })
       }
+      track('notify_me_completed', { existingAccount: !!data.existingAccount })
       setCaptureDone(true)
     } catch (e) {
       console.log('[onboarding] capture-lead error:', e.message)
@@ -485,6 +543,7 @@ export default function Onboarding() {
   const handleSaveShare = async () => {
     setShareError('')
     setSharing(true)
+    track('save_share_clicked')
     try {
       const res = await fetch('/api/save-share', {
         method: 'POST',
@@ -496,6 +555,7 @@ export default function Onboarding() {
         setShareError(data.error || 'Something went wrong. Please try again.')
         return
       }
+      track('save_share_completed')
       setShareToken(data.token)
     } catch (e) {
       console.log('[onboarding] save-share error:', e.message)
@@ -671,7 +731,7 @@ export default function Onboarding() {
                   </p>
                 </div>
                 {qualifiedCount > 0 && (
-                  <div className="free-tag">3 free · <Link href="/signup" className="upgrade-link">Sign up for more</Link></div>
+                  <div className="free-tag">3 free · <Link href="/signup" className="upgrade-link" onClick={() => track('signup_link_clicked', { source: 'upsell_tag' })}>Sign up for more</Link></div>
                 )}
               </div>
 
@@ -943,7 +1003,7 @@ export default function Onboarding() {
               <h2 className="gate-headline">You've used your free scan</h2>
               <p className="gate-sub">Sign up free to scan again and get leads automatically every day.</p>
               <div className="gate-actions">
-                <Link href="/signup" className="btn-primary">Sign up — Free →</Link>
+                <Link href="/signup" className="btn-primary" onClick={() => track('signup_link_clicked', { source: 'scan_gate' })}>Sign up — Free →</Link>
                 <button className="gate-back" onClick={() => { setStage('input'); setUrl('') }}>← Back</button>
               </div>
             </div>

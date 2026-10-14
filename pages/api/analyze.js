@@ -11,6 +11,12 @@ async function gemini(messages, maxTokens, temperature, _isRetry = false) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GEMINI_API_KEY}` },
       body: JSON.stringify({ model: 'gemini-3.5-flash-lite', messages, max_tokens: maxTokens, temperature }),
+      // Without this, a hung Gemini response runs until Vercel's own 60s
+      // hard-kill instead of failing fast enough to let Groq/Nemotron get
+      // a real shot — exactly what happened in production (see the "jina
+      // content length... trying Gemini... Task timed out after 60
+      // seconds" log with nothing in between).
+      signal: AbortSignal.timeout(20000),
     })
 
     if (res.status === 429 && !_isRetry) {
@@ -45,6 +51,7 @@ async function groq(messages, maxTokens, temperature, model = 'openai/gpt-oss-12
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature, reasoning_effort: 'low' }),
+      signal: AbortSignal.timeout(20000),
     })
     const data = await res.json()
     console.log('[analyze:groq] status:', res.status, '| error:', data.error?.message || 'none')
@@ -65,6 +72,7 @@ async function nemotron(messages, maxTokens, temperature) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
       body: JSON.stringify({ model: 'nvidia/nemotron-3-ultra-550b-a55b:free', messages, max_tokens: maxTokens, temperature }),
+      signal: AbortSignal.timeout(20000),
     })
     const data = await res.json()
     if (data.error) { console.log('[analyze:nemotron] error:', data.error.message); return '' }
@@ -223,7 +231,14 @@ Now write specificProblems for THIS specific product using this same level of sp
 problemKeywords
 Array of 8-12 strings. Words or short 2-3 word phrases that appear in a Reddit post ONLY when someone has this specific problem — not just when they're in the general audience.
 
+These are used as a literal search query against Reddit, so they must be
+words a frustrated person would actually type BEFORE they know any
+solution exists — not words describing a solution, a tool category, or
+HOW/WHERE someone might go looking for help. Write the raw problem only.
+
 BAD (too broad, appear in any business post): "productivity", "business", "tool", "software", "help"
+BAD (describes a solution or search instead of the raw problem — do this for every product, not only ones related to search, marketing, or discovery): "find customers tool", "marketing automation software", "lead generation platform", "customer discovery app", "alternative to [category]"
+Watch for this especially when the product's own description already contains a channel, platform, or mechanism word (e.g. a product that works via email, Slack, or a specific website) — do not let that word leak into problemKeywords just because it appeared in your analysis of the product. A keyword describing where or how the SOLUTION operates is always wrong here, even if that word is accurate to the product itself.
 GOOD for workflow automation: "manual copy", "automate between", "connect my apps", "zap", "make.com alternative", "n8n", "webhook", "trigger when", "sync my"
 GOOD for email tool: "smtp", "deliverability", "spam folder", "sendgrid", "mailgun", "bounce rate", "transactional email", "email going to spam"
 GOOD for scheduling: "back and forth email", "booking link", "calendly alternative", "schedule a call", "availability"

@@ -232,3 +232,21 @@ ALTER TABLE product_profiles ADD COLUMN IF NOT EXISTS last_analyzed_at TIMESTAMP
 -- old seen_posts rows are harmless but grow forever. Reddit's "new" feed
 -- won't resurface anything this old, so periodically pruning is safe:
 --   DELETE FROM seen_posts WHERE scored_at < now() - interval '60 days';
+
+-- ── Homepage scan ticker ────────────────────────────────────────────────
+-- One row per completed scan that found at least one qualified lead —
+-- logged from every scan path (main onboarding flow, share page's
+-- "notify me" flow), not just ones that end in a signup or a share link.
+-- Deliberately minimal: product name + numbers only, never lead content
+-- or subreddit-level detail, since this is public-facing. No RLS needed —
+-- only ever written via the service-role key from /api/log-scan; read
+-- publicly (unauthenticated) via /api/scan-feed, which selects only these
+-- columns, never anything else from product_profiles.
+CREATE TABLE IF NOT EXISTS scan_feed (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  product_name TEXT NOT NULL,
+  lead_count INTEGER NOT NULL,
+  top_score NUMERIC NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS scan_feed_created_at_idx ON scan_feed (created_at DESC);
