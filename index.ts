@@ -22,9 +22,45 @@ const PLAN_LIMITS: Record<string, number> = {
 
 const UNLIMITED_EMAIL = 'bundepunemmanuel@gmail.com'
 
+// ─── Shared Reddit quota wait ────────────────────────────────────────────
+// Reddit enforces a real, numeric, per-IP rate limit — roughly one request
+// per ~30-60 second reset window, shared across the ENTIRE app, not just
+// this cron run. /api/reddit.js persists the latest X-Ratelimit-Reset (as
+// an absolute timestamp) to reddit_rate_limit on every response it
+// handles, anywhere in the app. Reading it here directly via the
+// service-role client already in scope — no extra HTTP hop through the
+// Next.js app just to ask what it already wrote to the same database.
+async function waitForRedditQuota() {
+  const { data, error } = await supabase
+    .from('reddit_rate_limit')
+    .select('reset_at')
+    .eq('id', 'global')
+    .maybeSingle()
+
+  if (error) {
+    console.log('[cron-scan] reddit_rate_limit read error (proceeding without a wait):', error.message)
+    return
+  }
+  if (!data?.reset_at) return // nothing persisted yet — first run ever, or reddit.js hasn't been hit since deploy
+
+  const waitMs = new Date(data.reset_at).getTime() - Date.now()
+  if (waitMs <= 0) return // already past reset
+
+  // Capped so one stale or implausibly-far-future reset value can't stall
+  // a whole batch past Supabase's 150s execution ceiling — 60s already
+  // covers the upper end of the real window (~30-60s), so this cap should
+  // only ever bind on bad data, not a genuine wait.
+  const cappedWaitMs = Math.min(waitMs, 60000)
+  console.log(`[cron-scan] waiting ${Math.ceil(cappedWaitMs / 1000)}s for Reddit's shared quota to reset`)
+  await new Promise(r => setTimeout(r, cappedWaitMs))
+}
+
 // ─── Reddit fetching — via Next.js proxy, NOT direct from Deno ───────────
 // Reddit blocks/throttles requests from Supabase Edge Function IPs.
 // The Next.js /api/reddit route already works reliably from Vercel's infra.
+// `subreddit` may be several names joined with "+" — a Reddit multireddit,
+// one combined request instead of one per subreddit (see the main handler
+// below), matching onboarding.js / share/[token].js.
 async function fetchSubreddit(subreddit: string) {
   try {
     const res = await fetch(
@@ -44,7 +80,7 @@ async function fetchSubreddit(subreddit: string) {
   }
 }
 
-function parseAtom(xml: string, subreddit: string) {
+function parseAtom(xml: string, defaultSubreddit: string) {
   const posts = []
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)]
   for (const m of entries) {
@@ -52,6 +88,13 @@ function parseAtom(xml: string, subreddit: string) {
     const title = (entry.match(/<title[^>]*>([\s\S]*?)<\/title>/) || [])[1]
       ?.replace(/<!\[CDATA\[|\]\]>/g, '')?.trim() ?? ''
     const link = (entry.match(/<link[^>]*href="([^"]+)"/) || [])[1]?.trim() ?? ''
+    // Each entry carries its own subreddit via <category term="...">,
+    // which matters now that fetchSubreddit may be called with several
+    // subreddits joined by "+" (one combined multireddit request) — a
+    // single defaultSubreddit would be wrong for most entries in that
+    // case. Falls back to defaultSubreddit only if the tag is ever
+    // missing. Matches onboarding.js / share/[token].js.
+    const subreddit = (entry.match(/<category term="([^"]+)"/) || [])[1] || defaultSubreddit
     const rawContent = (entry.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1] || ''
     const content = rawContent
       .replace(/<!\[CDATA\[|\]\]>/g, '')
@@ -216,7 +259,17 @@ Deno.serve(async (req) => {
     // unprocessed after this batch, we dynamically schedule a one-time
     // follow-up run ~2 minutes out via schedule_followup_batch(), which
     // repeats until the whole hour's queue is empty.
-    const BATCH_SIZE = 3
+    //
+    // Dropped from 3 to 2: waitForRedditQuota() (below) now waits for
+    // Reddit's real reset before every user's fetch — capped at 60s, but
+    // genuinely up to that long — instead of the old flat 20s stagger. A
+    // batch of 3 could have two such waits back-to-back (worst case 120s)
+    // plus three users' worth of actual fetch+scoring time on top, which
+    // risks the 150s ceiling outright. A batch of 2 has at most one real
+    // wait (worst case 60s), leaving comfortable room. If per-user work
+    // time grows later (e.g. pass-1 relevance scoring in score.js adding a
+    // second AI call per user), re-check this math before raising it back.
+    const BATCH_SIZE = 2
     const now = new Date()
     const startOfHour = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours())
 
@@ -261,21 +314,6 @@ Deno.serve(async (req) => {
     let insertErrorCount = 0
     const debug: any[] = []
 
-    // Groq's free-tier limit is 8,000 tokens/minute, shared across ALL
-    // calls on this account. If two users' scoring calls land in the same
-    // ~60s window, the second one gets rejected outright. Staggering by
-    // ~20s keeps each call in a different slice of that rolling window.
-    //
-    // NOTE — this stagger is now safe from Supabase's 150s ceiling
-    // regardless of total user count, since batching (above) caps each
-    // invocation to BATCH_SIZE users no matter how many exist overall.
-    // Within a single batch of 3, worst case is roughly: 3 x (20s stagger
-    // + ~9s sequential subreddit fetch + fetch/score time) — comfortably
-    // under 150s. If BATCH_SIZE itself needs to grow later, re-check this
-    // math against the actual per-user time before raising it.
-    const STAGGER_MS = 20000
-    let isFirstScoredUser = true
-
     for (const profile of batch) {
       const userId = profile.user_id
 
@@ -312,13 +350,18 @@ Deno.serve(async (req) => {
         continue
       }
 
-      // Only stagger between users that actually reach a scoring call —
-      // no point burning time budget delaying in front of a skip.
-      if (!isFirstScoredUser) {
-        console.log(`[cron-scan] waiting ${STAGGER_MS / 1000}s before next user (rate-limit spacing)`)
-        await new Promise(r => setTimeout(r, STAGGER_MS))
-      }
-      isFirstScoredUser = false
+      // Wait for Reddit's actual shared quota to reset before this user's
+      // fetch — not just between users within this batch, but ALSO before
+      // the very first one. The quota is shared across the whole app (any
+      // visitor's browser scan, any share-page notify, could have used it
+      // moments ago), so "first user in this batch" isn't the same thing
+      // as "quota is definitely open." waitForRedditQuota() resolves
+      // immediately when the persisted reset is already in the past (the
+      // common case), so this costs nothing extra when the quota's genuinely
+      // free. This also comfortably covers whatever spacing Groq's scoring
+      // calls still need from each other — the real reset wait is rarely
+      // shorter than the old flat 20s stagger, and often longer.
+      await waitForRedditQuota()
 
       const remainingQuota = limit - leadsToday
 
@@ -345,21 +388,38 @@ Deno.serve(async (req) => {
 
       const subreddits = (analysis.subreddits || []).slice(0, 6)
 
-      // Fetch subreddits ONE AT A TIME with a short pause between each,
-      // instead of all 6 simultaneously via Promise.all. A burst of 6
-      // concurrent requests from the same IP appears to get silently
-      // emptied out by Reddit sometimes — confirmed by testing subreddits
-      // individually (all returned real posts) vs. via the cron's
-      // concurrent burst (returned 0 for all 6). Sequential, spaced-out
-      // requests mirror what a real browser/manual test does, which we
-      // know works.
+      // One combined multireddit request for this user's whole subreddit
+      // list, instead of fetching each one separately — same treatment
+      // onboarding.js / share/[token].js already got. The old
+      // one-at-a-time loop cost up to 6 Reddit requests per user, with
+      // waitForRedditQuota() (above) meaning every one of those beyond the
+      // first would otherwise sit through its own ~30-60s reset wait; the
+      // shared quota only reliably affords one request anyway, so this
+      // spends it on a single request that comes back with everything
+      // instead of 5 that are doomed before they're even sent.
+      const combinedPosts = subreddits.length ? await fetchSubreddit(subreddits.join('+')) : []
+      // parseAtom tags each entry with its own subreddit via <category>
+      // (see parseAtom above), so split the merged response back out per
+      // subreddit here — downstream code (filteredArrays, freshArrays, the
+      // round-robin interleave below) still expects one array per
+      // subreddit, same shape as before batching.
+      const postArrays: any[][] = subreddits.map((sub: string) =>
+        combinedPosts.filter((p: any) => p.subreddit === sub)
+      )
+
+      // Rules-checking is unrelated to the feed fetch above — different
+      // Reddit endpoints (about.json / about/rules.json) — and still needs
+      // its own per-subreddit request whenever its 30-day cache is stale,
+      // so it keeps its own loop and pacing rather than riding along with
+      // the now-batched feed fetch. NOTE: this still means a run touching
+      // several stale subreddits can burn more than the one request the
+      // shared quota reliably affords in a single window — out of scope
+      // for this pass (not what waitForRedditQuota/batching above were
+      // asked to fix), but worth knowing if 429s show up here specifically
+      // in the logs rather than on the feed fetch.
       const FETCH_PAUSE_MS = 1500
-      const postArrays: any[][] = []
       for (let i = 0; i < subreddits.length; i++) {
         const sub = subreddits[i]
-        const posts = await fetchSubreddit(sub)
-        postArrays.push(posts)
-
         // Auto-detect this subreddit's no-pitch rules, cached for 30 days
         // so we're not re-fetching rules on every single run. reply.js
         // reads the result from subreddit_rules when drafting a reply.

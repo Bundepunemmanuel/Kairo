@@ -250,3 +250,25 @@ CREATE TABLE IF NOT EXISTS scan_feed (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS scan_feed_created_at_idx ON scan_feed (created_at DESC);
+
+-- ── Reddit shared-quota persistence ────────────────────────────────────
+-- Reddit enforces a real, numeric, per-IP rate limit — roughly one request
+-- per ~30-60 second reset window, shared across the ENTIRE app (every
+-- visitor's browser scan, every share-page notify, every cron-scan run —
+-- all draw from the same budget, since they all land on the same outbound
+-- IP). This single row holds the most recent X-Ratelimit-Reset Reddit
+-- reported, converted to an absolute timestamp, so anything in the app can
+-- check "is the shared window open right now?" without spending part of
+-- that window just to find out.
+--
+-- Written only by /api/reddit.js (every response, success or 429) via the
+-- service-role key. Read by /api/reddit.js itself (mode=status, also
+-- service-role — used by onboarding.js and share/[token].js) and directly
+-- by cron-scan (index.ts) via the service-role key. Never touched by an
+-- anon client, so — same as seen_posts — no RLS policy is needed.
+CREATE TABLE IF NOT EXISTS reddit_rate_limit (
+  id TEXT PRIMARY KEY DEFAULT 'global',
+  reset_at TIMESTAMPTZ,
+  remaining NUMERIC,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
