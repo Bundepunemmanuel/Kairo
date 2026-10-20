@@ -251,6 +251,17 @@ CREATE TABLE IF NOT EXISTS scan_feed (
 );
 CREATE INDEX IF NOT EXISTS scan_feed_created_at_idx ON scan_feed (created_at DESC);
 
+-- The homepage ticker was inserting a new row on every completed scan,
+-- including repeat scans of the SAME product (same visitor re-scanning,
+-- or re-visiting onboarding) — the ticker would show duplicate-looking
+-- entries for one product instead of a single, improving one. `url` is
+-- the scanned product's own site URL (not a Reddit post URL — scan_feed
+-- has never tracked individual posts), passed through from onboarding.js
+-- / share/[token].js, and is what log-scan.js now looks up an existing
+-- row by before deciding whether to update it or insert a new one.
+ALTER TABLE scan_feed ADD COLUMN IF NOT EXISTS url TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS scan_feed_url_idx ON scan_feed (url) WHERE url IS NOT NULL;
+
 -- ── Reddit shared-quota persistence ────────────────────────────────────
 -- Reddit enforces a real, numeric, per-IP rate limit — roughly one request
 -- per ~30-60 second reset window, shared across the ENTIRE app (every
@@ -272,3 +283,36 @@ CREATE TABLE IF NOT EXISTS reddit_rate_limit (
   remaining NUMERIC,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ── Seven-day hold system ────────────────────────────────────────────────
+-- Accounts inactive for 7+ days (by user_settings.last_active_at — the
+-- same field admin.js's churn-risk view already uses, not a new signal)
+-- get held: cron-scan's skip-check (index.ts) stops spending AI tokens
+-- scanning/scoring for them, without touching their saved leads or
+-- deleting anything. held_at is when the hold actually started, so the
+-- dashboard banner and the daily cron job (below) both have a fixed point
+-- to reason from instead of re-deriving it from last_active_at each time
+-- (which would keep moving if, say, an admin manually releases and the
+-- user goes quiet again).
+ALTER TABLE product_profiles ADD COLUMN IF NOT EXISTS is_held BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE product_profiles ADD COLUMN IF NOT EXISTS held_at TIMESTAMPTZ;
+
+-- ── Push-engagement tracking (feeds #6's warn/delete cutoff) ────────────
+-- Nothing previously tracked whether a sent push was ever actually opened
+-- — send-push.js only knew a send succeeded, sw.js's notificationclick
+-- handler just navigated and told the server nothing. These three columns
+-- are what make "sent but not opened for N days" measurable at all.
+-- last_sent_at: set by send-push.js every time a push actually goes out —
+--   the #6 clock only runs for subscriptions that have been sent
+--   something; a user with zero leads so far isn't "ignoring" anything.
+-- last_opened_at: set when sw.js's notificationclick handler pings back
+--   (new endpoint on send-push.js, not a new file) — null means never
+--   opened, which the #6 cron job treats as "inactive since last_sent_at"
+--   rather than erroring on a missing date.
+-- warned_at: set the first time the Day 6 warning push goes out, so the
+--   daily job doesn't resend the warning every day it stays unopened, and
+--   so Day 7's delete step can tell "already warned, still ignored" apart
+--   from "never warned yet."
+ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ;
+ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS last_opened_at TIMESTAMPTZ;
+ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS warned_at TIMESTAMPTZ;
