@@ -26,12 +26,36 @@ self.addEventListener('push', (event) => {
 
 // Clicking the notification focuses an existing Kairo tab if one's open,
 // otherwise opens a new one at the relevant URL.
+//
+// Also pings send-push.js's mark-opened action with this subscription's
+// endpoint, the only reliable signal anywhere in the app that a push was
+// actually opened (not just sent) — see supabase-schema.sql's
+// push_subscriptions.last_opened_at comment and index.ts's #6 sweep,
+// which both depend entirely on this ping existing. Fire-and-forget: a
+// failed ping here should never block focusing/opening the tab the
+// person is actively trying to use right now.
 self.addEventListener('notificationclick', (event) => {
   event.notification.close()
   const targetUrl = event.notification.data?.url || '/dashboard'
 
   event.waitUntil(
-    clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
+    (async () => {
+      try {
+        const registration = await self.registration
+        const subscription = await registration.pushManager.getSubscription()
+        if (subscription?.endpoint) {
+          fetch('/api/send-push', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'mark-opened', endpoint: subscription.endpoint }),
+          }).catch(() => {})
+        }
+      } catch (e) {
+        // Non-fatal — worst case, #6's clock just doesn't get this one
+        // click recorded; it never blocks the person from reaching the app.
+      }
+
+      const windowClients = await clients.matchAll({ type: 'window', includeUncontrolled: true })
       for (const client of windowClients) {
         if (client.url.includes(self.location.origin) && 'focus' in client) {
           client.navigate(targetUrl)
@@ -41,6 +65,6 @@ self.addEventListener('notificationclick', (event) => {
       if (clients.openWindow) {
         return clients.openWindow(targetUrl)
       }
-    })
+    })()
   )
 })

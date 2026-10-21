@@ -45,7 +45,14 @@ async function groq(messages, maxTokens, temperature, model = 'openai/gpt-oss-12
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature, reasoning_effort: 'low' }),
-      signal: AbortSignal.timeout(20000),
+      // 12s, down from 20s — see gemini()'s comment for the full budget
+      // reasoning. Groq is now raced against gpt-oss-20b (see
+      // raceForContent below) rather than tried after it sequentially, so
+      // this and gpt-oss-20b's timeout no longer sum in the worst case —
+      // but Groq ALSO has its own rate-limit retry below, which is a
+      // second, separate way this function alone could eat the whole 60s
+      // budget if left uncapped.
+      signal: AbortSignal.timeout(12000),
     })
     const data = await res.json()
     if (data.error) {
@@ -54,9 +61,15 @@ async function groq(messages, maxTokens, temperature, model = 'openai/gpt-oss-12
       // Rate limit hit (TPM/RPM ceiling) — this is transient, not a real
       // "no content" failure. Wait the time Groq tells us and retry once,
       // instead of silently treating it as zero qualifying leads.
+      //
+      // Capped at 10s regardless of what Groq's error message actually
+      // says — it's been seen asking for 30s+, and an uncapped wait here
+      // means groq() alone (12s attempt + uncapped wait + 12s retry) could
+      // burn most of the 60s ceiling by itself, independent of anything
+      // else in the fallback chain. 10s is a real wait, just a bounded one.
       const isRateLimit = res.status === 429 || /rate.?limit/i.test(data.error.message || '')
       if (isRateLimit && !_isRetry) {
-        const waitSeconds = parseRetryAfterSeconds(data.error.message) || 15
+        const waitSeconds = Math.min(parseRetryAfterSeconds(data.error.message) || 10, 10)
         console.log(`[groq:${model}] rate limited — retrying in ${waitSeconds}s`)
         await new Promise(r => setTimeout(r, waitSeconds * 1000))
         return groq(messages, maxTokens, temperature, model, true)
@@ -71,6 +84,40 @@ async function groq(messages, maxTokens, temperature, model = 'openai/gpt-oss-12
   }
 }
 
+// Races several labeled {label, promise} entries, resolving with whichever
+// gives the first NON-EMPTY result — not just whichever settles first.
+// Plain Promise.any/Promise.race would consider a fast-but-empty result a
+// "win" over a slower-but-real one still in flight, since both
+// gptOss20b() and groq() already catch their own errors and resolve with
+// '' rather than rejecting. Only resolves '' once every entry has settled
+// empty (or rejected) — so a slow-but-successful provider still gets used
+// if the other one comes back empty first.
+async function raceForContent(labeledPromises) {
+  return new Promise((resolve) => {
+    let remaining = labeledPromises.length
+    let resolved = false
+    for (const { label, promise } of labeledPromises) {
+      promise
+        .then((content) => {
+          if (resolved) return
+          if (content) {
+            resolved = true
+            console.log(`[score] race winner: ${label}`)
+            resolve(content)
+          } else {
+            remaining--
+            if (remaining === 0 && !resolved) resolve('')
+          }
+        })
+        .catch((e) => {
+          console.log(`[score] race participant ${label} rejected:`, e.message)
+          remaining--
+          if (remaining === 0 && !resolved) resolve('')
+        })
+    }
+  })
+}
+
 // Third fallback only — no retry logic. By the time both Gemini and
 // Groq have failed, burning more time on a retry risks the function
 // timeout. Single best-effort attempt, fail-empty if it doesn't work.
@@ -79,23 +126,35 @@ async function groq(messages, maxTokens, temperature, model = 'openai/gpt-oss-12
 // it was hanging past the 20s timeout during the Aug 20 outage. Swapped
 // to gpt-oss-20b: fast enough for a free tier and behaves consistently
 // with the rest of the fallback chain.
+//
+// The ":free" suffix stopped resolving — OpenRouter started rejecting it
+// ("This model is unavailable for free. The paid version is available
+// now - use this slug instead: openai/gpt-oss-20b"), which meant this
+// whole tier was erroring out instantly on every call, collapsing the
+// fallback chain from three real tiers to two (Gemini → Groq) without it
+// being obvious from the error alone. Using the slug OpenRouter's own
+// error message named.
 async function gptOss20b(messages, maxTokens, temperature) {
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` },
       body: JSON.stringify({
-        model: 'openai/gpt-oss-20b:free',
+        model: 'openai/gpt-oss-20b',
         messages,
         max_tokens: maxTokens,
         temperature,
       }),
-      // No timeout here previously — during the Aug 20 outage this let a
-      // hung request run until Vercel's own 60s hard-kill, instead of
-      // failing fast enough to let Groq (now the final fallback) get a
-      // real shot. 20s leaves genuine room for Groq afterward within the
-      // 60s ceiling.
-      signal: AbortSignal.timeout(20000),
+      // 12s, down from 20s. Previously this and Groq's timeout summed
+      // worst-case (tried sequentially, one full timeout each) — confirmed
+      // in production: Gemini (20s) then gpt-oss-20b (20s) both timed out
+      // back-to-back before Groq finally answered, burning 40s of the 60s
+      // budget on two dead ends. Now raced against Groq instead of tried
+      // after it (see raceForContent above), so the worst case is
+      // whichever of the two is slower, not both summed — but keeping the
+      // per-attempt timeout itself tight still matters, since a hung
+      // request here would otherwise drag the whole race out regardless.
+      signal: AbortSignal.timeout(12000),
     })
     const data = await res.json()
     if (data.error) { console.log('[gpt-oss-20b] error:', data.error.message); return '' }
@@ -117,12 +176,21 @@ async function gemini(messages, maxTokens, temperature, _isRetry = false) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GEMINI_API_KEY}` },
       body: JSON.stringify({ model: 'gemini-3.5-flash-lite', messages, max_tokens: maxTokens, temperature }),
-      signal: AbortSignal.timeout(20000),
+      // 12s, down from 20s — three tiers at 20s each meant the worst case
+      // for the whole fallback chain could sit right at the 60s ceiling
+      // before accounting for anything else the function does (fetching
+      // Reddit, parsing, the Supabase writes around it). At 12s per
+      // attempt, plus gpt-oss-20b/Groq now racing each other instead of
+      // running sequentially (see raceForContent below), the worst
+      // realistic case drops to roughly 12s (Gemini) + ~12-15s (the
+      // slower of the race) + retry waits — comfortably under 60s with
+      // real margin left over, instead of exactly at it.
+      signal: AbortSignal.timeout(12000),
     })
 
     if (res.status === 429 && !_isRetry) {
-      console.log('[gemini] rate limited — retrying in 15s')
-      await new Promise(r => setTimeout(r, 15000))
+      console.log('[gemini] rate limited — retrying in 8s')
+      await new Promise(r => setTimeout(r, 8000))
       return gemini(messages, maxTokens, temperature, true)
     }
 
@@ -132,8 +200,23 @@ async function gemini(messages, maxTokens, temperature, _isRetry = false) {
 
     // Gemini sometimes returns 200 with genuinely blank content — not an
     // error, just nothing. Retry once before falling through to Groq.
+    //
+    // This has been firing on most pass-2 calls in production (4 of 5 in
+    // one recent window) — far more than occasional flakiness. Logging
+    // finish_reason and usage here, diagnostic-only for now, rather than
+    // guessing at a fix: if finish_reason comes back "length" with
+    // completion_tokens near maxTokens, it means Gemini is spending its
+    // whole budget on internal reasoning before ever emitting visible
+    // content, and the real fix is raising max_tokens (or disabling
+    // reasoning for this call) — not something else like a prompt or
+    // safety-filter issue, which would show a different finish_reason.
+    // Don't change the token budgets based on this alone until a real run
+    // confirms which one it actually is.
     if (!content && !_isRetry) {
-      console.log('[gemini] empty content on success response — retrying once')
+      console.log(
+        `[gemini] empty content on success response — finish_reason: ${data.choices?.[0]?.finish_reason ?? 'none'}, ` +
+        `usage: ${data.usage ? JSON.stringify(data.usage) : 'none'} — retrying once`
+      )
       await new Promise(r => setTimeout(r, 3000))
       return gemini(messages, maxTokens, temperature, true)
     }
@@ -145,25 +228,75 @@ async function gemini(messages, maxTokens, temperature, _isRetry = false) {
 }
 
 function parseJSON(raw) {
+  // Strip qwen think blocks and markdown fences
+  const clean = (raw || '')
+    .replace(/<think>[\s\S]*?<\/think>/g, '')
+    .replace(/```json|```/g, '')
+    .trim()
+
+  const match = clean.match(/\[[\s\S]*\]/)
+  const candidate = match ? match[0] : clean
+
   try {
-    // Strip qwen think blocks and markdown fences
-    const clean = raw
-      .replace(/<think>[\s\S]*?<\/think>/g, '')
-      .replace(/```json|```/g, '')
-      .trim()
-    const match = clean.match(/\[[\s\S]*\]/)
-    if (!match) return null
-    return JSON.parse(match[0])
+    return JSON.parse(candidate)
+  } catch {
+    // Didn't parse as-is — most likely the response got cut off mid-array
+    // by hitting max_tokens before finishing (confirmed in production: a
+    // Groq response ending mid-string lost all 40 scored posts in that
+    // batch, even though everything before the cutoff had scored fine).
+    // Salvage whatever complete objects came back instead of discarding
+    // the entire result over the one that got cut off.
+    return salvageTruncatedArray(clean)
+  }
+}
+
+// Walks the text looking for the LAST point at which a top-level object
+// genuinely closed — tracking brace depth and whether we're inside a
+// quoted string, so a "}" that's just a character inside someone's post
+// body doesn't get mistaken for the end of an object. Returns null if not
+// even one complete object can be recovered.
+function salvageTruncatedArray(clean) {
+  const start = clean.indexOf('[')
+  if (start === -1) return null
+  const body = clean.slice(start + 1)
+
+  let depth = 0
+  let inString = false
+  let escape = false
+  let lastCompleteEnd = -1
+
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i]
+    if (escape) { escape = false; continue }
+    if (c === '\\') { escape = true; continue }
+    if (c === '"') { inString = !inString; continue }
+    if (inString) continue
+    if (c === '{') depth++
+    else if (c === '}') {
+      depth--
+      if (depth === 0) lastCompleteEnd = i
+    }
+  }
+
+  if (lastCompleteEnd === -1) return null
+
+  try {
+    const parsed = JSON.parse(`[${body.slice(0, lastCompleteEnd + 1)}]`)
+    console.log(`[score] response was truncated mid-array — salvaged ${parsed.length} complete object(s) before the cutoff instead of discarding the whole batch`)
+    return parsed
   } catch {
     return null
   }
 }
 
-// ─── Score all posts in one call (no batching complexity) ─────────────────
-// Takes up to 40 posts, returns { scored: [...], scoredUrls: [...] }
-// scoredUrls is every post actually sent to an AI — used by cron-scan to
-// mark them in seen_posts so they're never re-scored, whether they
-// qualified as a lead or not.
+// ─── Score all posts, two passes ───────────────────────────────────────
+// Takes up to 250 posts, returns { scored: [...], closeMatches: [...], scoredUrls: [...] }.
+// Pass 1 (relevanceFilter, above) is a cheap loose screen over the full
+// sample; pass 2 (below, inside scorePosts) is the existing full-reasoning
+// prompt, unchanged, run only on whoever survives pass 1.
+// scoredUrls is every post actually sent to an AI across both passes —
+// used by cron-scan to mark them in seen_posts so they're never re-scored,
+// whether they qualified as a lead or not.
 // Interleaves posts round-robin by subreddit (r1-s1, r1-s2, r1-s3, r2-s1,
 // ...) instead of leaving them in whatever order they arrived. Moved here
 // from being each caller's own responsibility — cron-scan did its own
@@ -187,17 +320,142 @@ function interleaveBySubreddit(posts) {
   return result
 }
 
+// ─── Pass 1: cheap relevance screen ─────────────────────────────────────
+// reddit.js requests up to 250 posts per combined multireddit request (up
+// from 25/sub via separate requests), though Reddit's .rss endpoint
+// silently clamps that to 100 in practice — see reddit.js for the full
+// explanation. Either way, running the full sample through the full
+// scoring prompt (below) isn't affordable: this pass is what makes that
+// tradeoff workable. One cheap call, relevance
+// only (0-10, no sub-scores, no reasoning text), deliberately loose cutoff
+// — a false positive here just costs a few extra tokens in pass 2, but a
+// false negative drops a real lead before the real scoring prompt ever
+// sees it. Passive-demand posts in particular (quiet, not phrased as an
+// ask) are exactly what a stricter cutoff would wrongly filter here.
+const RELEVANCE_THRESHOLD = 2 // out of 10 — intentionally loose, see above
+
+async function relevanceFilter(sample, analysis) {
+  const input = sample.map((p, i) => ({
+    i,
+    title: p.title,
+    body: (p.body || '').slice(0, 150),
+    sub: p.subreddit,
+  }))
+
+  const messages = [
+    {
+      role: 'system',
+      content: 'Fast relevance screen. Return only a valid JSON array. No markdown. No explanation.',
+    },
+    {
+      role: 'user',
+      content: `Rate how plausibly relevant EVERY one of these Reddit posts is to this product, on a 0-10 scale. This is a loose first pass, not the real scoring — when in doubt, score it higher rather than lower. Rate every post, even ones that obviously don't fit — do not skip any, do not return [] to mean "nothing fits."
+
+PRODUCT: ${analysis.name}
+WHAT IT DOES: ${analysis.description}
+SPECIFIC PROBLEMS IT SOLVES: ${analysis.specificProblems?.slice(0, 5).join(' | ') || ''}
+
+0-1 = nothing to do with this product's problem space, even loosely
+2-10 = any plausible connection at all — including posts that only quietly mention the problem without explicitly asking for help
+
+Format: [{"i":0,"r":7}]
+
+Posts: ${JSON.stringify(input)}`,
+    },
+  ]
+
+  console.log('[score:pass1] trying Gemini (primary)')
+  let raw = await gemini(messages, 4000, 0.1)
+
+  if (!raw) {
+    // gpt-oss-20b and Groq raced concurrently instead of tried one after
+    // the other — same reasoning as pass 2 below, applied here too since
+    // this fallback chain has the identical sequential-timeout risk.
+    console.log('[score:pass1] Gemini empty — racing gpt-oss-20b and Groq')
+    raw = await raceForContent([
+      { label: 'gpt-oss-20b', promise: gptOss20b(messages, 3000, 0.1) },
+      { label: 'groq', promise: groq(messages, 2000, 0.1) },
+    ])
+  }
+
+  // Previously the only pass-1 visibility was the survivor count — no way
+  // to tell "model genuinely rated everything low" apart from some other
+  // cause without the actual ratings. Matches pass 2's existing raw-log
+  // line below.
+  console.log(`[score:pass1] raw (150): ${raw.slice(0, 150)}`)
+
+  const rated = parseJSON(raw)
+  if (!rated) {
+    // Fail-open: if this cheap pass itself comes back unparseable, don't
+    // let a flaky relevance call silently drop every post before pass 2
+    // ever runs — send the whole sample through instead. Costs more
+    // tokens on a bad day; never silently loses every lead to it.
+    console.log('[score:pass1] parse failed — passing full sample through to pass 2 unfiltered')
+    return sample
+  }
+
+  const relevance = new Map(
+    rated.filter(r => typeof r.i === 'number').map(r => [r.i, Number(r.r) || 0])
+  )
+
+  // Pairs each post's own title with its index and rating — the raw
+  // model-output log above (just {"i":5,"r":4} pairs) gave no way to
+  // check a rating against what the post actually said. "(unrated)"
+  // marks an index the model skipped despite instructions, which still
+  // fails open to r=10 below, same as a parse failure does for the whole
+  // batch.
+  sample.forEach((p, i) => {
+    const r = relevance.has(i) ? relevance.get(i) : 10
+    const unrated = relevance.has(i) ? '' : ' (unrated, failed open)'
+    console.log(`[score:pass1] i=${i} r=${r}${unrated} — "${(p.title || '').slice(0, 80)}"`)
+  })
+
+  // Unrated indices (the model skipped one despite instructions) fail open
+  // too, same reasoning as a parse failure above — treated as relevant
+  // rather than silently dropped.
+  const survivors = sample
+    .map((p, i) => ({ post: p, r: relevance.has(i) ? relevance.get(i) : 10 }))
+    .filter(x => x.r >= RELEVANCE_THRESHOLD)
+    .sort((a, b) => b.r - a.r)
+    .map(x => x.post)
+
+  console.log(`[score:pass1] ${sample.length} posts → ${survivors.length} survived (threshold ${RELEVANCE_THRESHOLD})`)
+  return survivors
+}
+
 async function scorePosts(posts, analysis) {
-  // Raised from 40 — paired with proportional max_tokens increases on
-  // every provider's call below (see gemini/groq/gptOss20b), so a bigger
-  // sample doesn't risk truncating mid-response the way a cap raised
-  // without a matching token bump would (the exact failure mode that
-  // broke JSON parsing once before — see score.js's parse-failure
-  // handling). Fairness now comes from interleaveBySubreddit regardless of
-  // what order posts arrived in, not from trusting the caller to have
-  // already done it.
-  const sample = interleaveBySubreddit(posts).slice(0, 60)
-  const scoredUrls = sample.map(p => p.url).filter(Boolean)
+  // Capped at 250 (was 60) — matches reddit.js's requested limit, even
+  // though in practice Reddit's own 100-post ceiling means this rarely
+  // slices anything off (a single request currently returns ~100 at
+  // most). Every post in this full sample is what scoredUrls (below)
+  // marks as "sent to an AI for scoring" in cron-scan's seen_posts dedup —
+  // pass 1 genuinely did score all of them, even the ones that don't make
+  // it to pass 2.
+  const fullSample = interleaveBySubreddit(posts).slice(0, 250)
+  const scoredUrls = fullSample.map(p => p.url).filter(Boolean)
+
+  if (!fullSample.length) return { scored: [], closeMatches: [], scoredUrls }
+
+  // ─── Pass 1 — cheap relevance screen over the full up-to-100 sample ───
+  const relevant = await relevanceFilter(fullSample, analysis)
+
+  if (!relevant.length) {
+    // Confirmed in production (Caloriesai.com, 97 posts → 0 survived):
+    // without this, pass 2 still ran — a full Gemini call (including its
+    // empty-content retry) spent scoring an empty list, for no reason.
+    // scoredUrls still covers the full pass-1 sample above, so these
+    // posts are correctly marked seen either way.
+    console.log('[score] 0 posts survived pass 1 — skipping pass 2 (nothing to score)')
+    return { scored: [], closeMatches: [], scoredUrls }
+  }
+
+  // ─── Pass 2 — existing full scoring prompt, completely unchanged below,
+  // including this 60-post cap: it's what the max_tokens budgets on
+  // gemini/groq/gptOss20b were actually sized for, and pass 1 already did
+  // the real work of cutting 250 down to the posts worth that budget —
+  // sorted by relevance above, so if more than 60 survive, these are the
+  // 60 most promising, not just the first 60 encountered.
+  const sample = relevant.slice(0, 60)
 
   const input = sample.map((p, i) => ({
     i,
@@ -251,30 +509,42 @@ Posts: ${JSON.stringify(input)}`,
   // Gemini first — highest-volume call in the app (every cron run, every
   // user), so it needs a fast, reliable primary.
   //
-  // gpt-oss-20b (via OpenRouter free tier) is second, not last, as of the
-  // Aug 20 outage: Groq's 200K TPD budget was exhausted mid-day, and every
-  // request during that window burned 15-30s on a doomed rate-limit retry
-  // before ever reaching the real final fallback — which then had almost
-  // no time left before Vercel's 60s hard timeout killed the whole
-  // function. This fallback has no shared daily-token risk with Gemini's
-  // own outages, so it gets tried while there's still real time budget
-  // left, and Groq — the one actually prone to running dry — is now the
-  // true last resort instead of a wasted middle step.
-  // Raised proportionally to the sample-size increase (40→60 posts, ~1.5x)
-  // on all three providers — a cap raised without matching headroom risks
-  // the response getting cut off mid-JSON, which breaks parsing entirely
-  // rather than just scoring fewer posts.
+  // gpt-oss-20b and Groq are RACED (raceForContent, above) rather than
+  // tried one after the other, since Gemini (primary) → gpt-oss-20b → Groq
+  // sequentially meant a bad run could burn each tier's full timeout one
+  // after another — confirmed in production: Gemini and gpt-oss-20b both
+  // timed out in full (20s each) back to back before Groq finally
+  // answered, 40 of the 60s budget gone on two dead ends before the
+  // provider that actually worked ever got a chance. Racing the two
+  // fallbacks means the worst case is whichever of them is slower, not
+  // both summed. Groq still never goes first/alone, though — its own
+  // daily token budget has run dry mid-day before (the Aug 20 outage),
+  // which is exactly the kind of failure a race against gpt-oss-20b
+  // covers for, rather than leaving Groq to carry the whole fallback step
+  // by itself again.
+  // Previously 6000 / 3800 / 2300 — raised proportionally to the
+  // sample-size increase (40→60 posts, ~1.5x) on all three providers, but
+  // that scaling was backwards for what each tier actually needs: by the
+  // time a call reaches gpt-oss-20b or Groq, it's because Gemini already
+  // failed, and each one is the LAST chance for this batch — there's
+  // nothing after them to catch a truncation. Giving the final fallback
+  // the smallest budget of the three is exactly how Runway's 40 scored
+  // posts got lost in production: Groq's 2300-token budget wasn't enough
+  // for 40 full objects (each with two free-text fields — problem_text
+  // and why — this schema isn't small per post), the response cut off
+  // mid-string, and the whole batch failed to parse. All three now get
+  // the same generous budget instead of shrinking down the fallback
+  // chain — parseJSON's salvage path (above) is the backstop if a
+  // response is still cut off at this size.
   console.log('[score] trying Gemini (primary)')
   let raw = await gemini(messages, 6000, 0.1)
 
   if (!raw) {
-    console.log('[score] Gemini empty — falling back to gpt-oss-20b')
-    raw = await gptOss20b(messages, 3800, 0.1)
-  }
-
-  if (!raw) {
-    console.log('[score] gpt-oss-20b empty — falling back to Groq (final)')
-    raw = await groq(messages, 2300, 0.1)
+    console.log('[score] Gemini empty — racing gpt-oss-20b and Groq')
+    raw = await raceForContent([
+      { label: 'gpt-oss-20b', promise: gptOss20b(messages, 6000, 0.1) },
+      { label: 'groq', promise: groq(messages, 6000, 0.1) },
+    ])
   }
 
   console.log(`[score] raw (150): ${raw.slice(0, 150)}`)

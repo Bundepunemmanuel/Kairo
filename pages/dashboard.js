@@ -178,6 +178,28 @@ export default function Dashboard() {
     }
   }
 
+  // Resume uses the client-side supabase call directly against
+  // product_profiles — the existing "users can update own profile" RLS
+  // policy already covers this, so no new API endpoint is needed just for
+  // the user's own half of the hold toggle (admin.js's set-hold action is
+  // the admin-side equivalent, same fields, different caller).
+  const [resuming, setResuming] = useState(false)
+  const handleResume = async () => {
+    setResuming(true)
+    try {
+      const { error } = await supabase
+        .from('product_profiles')
+        .update({ is_held: false, held_at: null })
+        .eq('user_id', user.id)
+      if (error) throw error
+      setProfile(p => ({ ...p, is_held: false, held_at: null }))
+    } catch (e) {
+      console.log('[dashboard] resume error:', e.message)
+    } finally {
+      setResuming(false)
+    }
+  }
+
   const handleDelete = async (leadId) => {
     setOpenMenuId(null)
     setActiveLeads(prev => prev.filter(l => l.id !== leadId))
@@ -339,6 +361,18 @@ export default function Dashboard() {
               </>
             )}
             {pushBannerError && <span className="notif-reminder-error">{pushBannerError}</span>}
+          </div>
+        )}
+
+        {profile?.is_held && (
+          <div className="held-reminder-banner">
+            <span>
+              ⏸️ Scanning is paused for this account — you've been inactive for 7+ days, so Kairo stopped
+              checking Reddit on your behalf to save resources. Your saved leads are untouched.
+            </span>
+            <button className="notif-reminder-btn" onClick={handleResume} disabled={resuming}>
+              {resuming ? 'Resuming...' : 'Resume scanning'}
+            </button>
           </div>
         )}
 

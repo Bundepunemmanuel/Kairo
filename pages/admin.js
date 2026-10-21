@@ -156,6 +156,29 @@ export default function Admin() {
     }
   }
 
+  // No confirm modal, unlike plan changes — holding/releasing is cheap to
+  // reverse either direction (just flips a flag, doesn't touch billing or
+  // saved leads), so the extra click isn't buying much safety here.
+  const handleToggleHold = async (u) => {
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'set-hold',
+          requesterEmail: user.email,
+          targetUserId: u.user_id,
+          held: !u.is_held,
+        }),
+      })
+      const data = await res.json()
+      if (data.error) { alert(data.error); return }
+      await loadAdminData()
+    } catch (e) {
+      alert('Set hold failed: ' + e.message)
+    }
+  }
+
   const handleCleanup = async () => {
     if (!cleanupConfirm) { setCleanupConfirm(true); return }
     setCleanupRunning(true)
@@ -372,10 +395,24 @@ export default function Admin() {
                         {isExpanded ? '▾' : '▸'}
                       </button>
                       <div className="admin-user-info">
-                        <span className="admin-user-name">{u.name}</span>
+                        <span className="admin-user-name">
+                          {u.name}
+                          {u.is_held && <span className="admin-user-held-badge">Held</span>}
+                        </span>
                         <span className="admin-user-email">{u.email || 'no email on file'}</span>
-                        <span className="admin-user-meta">{u.url} · signed up {formatDate(u.created_at)} · scanned {formatRelative(u.last_scan_at)}</span>
+                        <span className="admin-user-meta">
+                          {u.url} · signed up {formatDate(u.created_at)} · scanned {formatRelative(u.last_scan_at)}
+                          {u.is_held && u.held_at && ` · held ${formatRelative(u.held_at)}`}
+                        </span>
                       </div>
+                      <button
+                        type="button"
+                        className="admin-user-hold-btn"
+                        onClick={() => handleToggleHold(u)}
+                        title={u.is_held ? 'Resume scanning for this account' : 'Hold this account (stop scanning)'}
+                      >
+                        {u.is_held ? 'Release' : 'Hold'}
+                      </button>
                       <select
                         className="dash-admin-plan-select"
                         value={u.plan}

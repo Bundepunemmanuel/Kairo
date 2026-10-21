@@ -26,7 +26,7 @@ export default async function handler(req, res) {
     // ─── Load all admin data, bypassing RLS via service role ─────────────
     if (action === 'get-admin-data') {
       const { data: allPlans } = await supabaseAdmin.from('user_plans').select('user_id, plan, updated_at')
-      const { data: allProfiles } = await supabaseAdmin.from('product_profiles').select('user_id, url, analysis, created_at, last_scan_at')
+      const { data: allProfiles } = await supabaseAdmin.from('product_profiles').select('user_id, url, analysis, created_at, last_scan_at, is_held, held_at')
       const { data: settingsRows } = await supabaseAdmin.from('user_settings').select('user_id, last_active_at')
 
       // Emails live in auth.users, not any table we can query directly —
@@ -117,6 +117,8 @@ export default async function handler(req, res) {
           plan: planRow?.plan || 'free',
           created_at: p.created_at,
           last_scan_at: p.last_scan_at,
+          is_held: p.is_held || false,
+          held_at: p.held_at || null,
         }
       })
 
@@ -256,6 +258,27 @@ export default async function handler(req, res) {
       if (error) throw error
 
       return res.status(200).json({ message: `Plan updated to ${newPlan}` })
+    }
+
+    // ─── Manually hold or release an account (#5) ─────────────────────────
+    // The admin-side half of the hold system — index.ts's daily job only
+    // ever sets is_held TRUE (7+ days inactive); this is the only path
+    // that can set it back to FALSE other than the user's own dashboard
+    // Resume button. held_at is cleared on release so a later re-hold
+    // starts a fresh clock rather than showing a stale date.
+    if (action === 'set-hold') {
+      const { targetUserId, held } = req.body
+      if (!targetUserId || typeof held !== 'boolean') {
+        return res.status(400).json({ error: 'targetUserId and a boolean held are required' })
+      }
+
+      const { error } = await supabaseAdmin
+        .from('product_profiles')
+        .update({ is_held: held, held_at: held ? new Date().toISOString() : null })
+        .eq('user_id', targetUserId)
+      if (error) throw error
+
+      return res.status(200).json({ message: held ? 'Account held' : 'Account released' })
     }
 
     return res.status(400).json({ error: 'Unknown action' })

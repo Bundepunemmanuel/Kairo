@@ -51,13 +51,19 @@ function parseAtom(xml, defaultSubreddit) {
 }
 
 // `subs` may be a single subreddit or several joined with "+" — see
-// onboarding.js for the full reasoning (encodeURIComponent → %2B → decodes
-// back to a literal "+" on our own /api/reddit, which reddit.js then
-// re-splits for the outbound Reddit request).
-async function fetchSubredditFromBrowser(subs, keywords) {
+// onboarding.js for the full reasoning (encodeURIComponent → %2B, which
+// Reddit decodes back to a literal "+" and reads as the multireddit
+// separator).
+//
+// No keywords param — reddit.js no longer reads one (week-search via
+// Reddit's search endpoint was tried, then reversed; not coming back).
+//
+// source='direct' (default) or 'worker' — see onboarding.js for the full
+// reasoning (the Cloudflare Worker proxy is a separate IP with its own
+// independent quota bucket).
+async function fetchSubredditFromBrowser(subs, source = 'direct') {
   try {
-    const kw = Array.isArray(keywords) && keywords.length ? `&keywords=${encodeURIComponent(keywords.join(','))}` : ''
-    const res = await fetch(`/api/reddit?sub=${encodeURIComponent(subs)}&sort=new${kw}`, { signal: AbortSignal.timeout(10000) })
+    const res = await fetch(`/api/reddit?sub=${encodeURIComponent(subs)}&sort=new&source=${source}`, { signal: AbortSignal.timeout(10000) })
     if (!res.ok) return []
     const xml = await res.text()
     if (!xml.includes('<entry>')) return []
@@ -67,27 +73,37 @@ async function fetchSubredditFromBrowser(subs, keywords) {
   }
 }
 
-// Fetches sequentially with a gap between each — see onboarding.js for
-// the full reasoning. Shrunk from 400ms now that /api/reddit.js routes
-// through a Cloudflare Worker instead of hitting Reddit directly from
-// Vercel's (previously rate-limited) IP.
-async function staggeredMap(items, fn, delayMs = 150) {
-  const results = []
-  for (let i = 0; i < items.length; i++) {
-    results.push(await fn(items[i], i))
-    if (i < items.length - 1) await new Promise(r => setTimeout(r, delayMs))
+// ─── Shared Reddit quota status ─────────────────────────────────────────
+// See onboarding.js for the full reasoning — a plain Supabase read via
+// reddit.js's mode=status, never an outbound Reddit request itself.
+// Returns both the direct and worker buckets.
+async function fetchQuotaStatus() {
+  try {
+    const res = await fetch('/api/reddit?mode=status', { signal: AbortSignal.timeout(5000) })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
   }
-  return results
 }
 
-// Splits subreddits into groups — raised from 3 to 6 (one request per
-// scan instead of two) — see onboarding.js's chunkSubreddits for the full
-// reasoning (production logs showed Reddit's quota hitting 0.0 after a
-// single request, so the second request was always doomed).
-function chunkSubreddits(subs, groupSize = 6) {
-  const groups = []
-  for (let i = 0; i < subs.length; i += groupSize) groups.push(subs.slice(i, i + groupSize).join('+'))
-  return groups
+// Splits up to 6 subreddits into two halves of up to 3, fetched
+// concurrently (direct + worker) — see onboarding.js's
+// fetchSubredditsDualPath for the full reasoning. Replaces the previous
+// chunkSubreddits + staggeredMap pair, which existed to pace requests
+// against each other under one shared quota; direct and worker don't
+// share anything, so there's nothing left to pace.
+async function fetchSubredditsDualPath(subreddits) {
+  const directSubs = subreddits.slice(0, 3)
+  const workerSubs = subreddits.slice(3, 6)
+
+  const [directPosts, workerPosts] = await Promise.all([
+    directSubs.length ? fetchSubredditFromBrowser(directSubs.join('+'), 'direct') : Promise.resolve([]),
+    workerSubs.length ? fetchSubredditFromBrowser(workerSubs.join('+'), 'worker') : Promise.resolve([]),
+  ])
+
+  console.log(`[share] direct ${directPosts.length} posts, worker ${workerPosts.length} posts`)
+  return [...directPosts, ...workerPosts]
 }
 
 const isValidUrl = str => {
@@ -128,10 +144,51 @@ export default function SharePage({ token, initialStatus, initialData }) {
   const [notifyError, setNotifyError] = useState('')
   const [notifyExisting, setNotifyExisting] = useState(false)
 
+  // ── Shared Reddit quota countdown — see onboarding.js for full reasoning ──
+  const [quotaResetAt, setQuotaResetAt] = useState(null)
+  const [quotaSecondsLeft, setQuotaSecondsLeft] = useState(0)
+
   useEffect(() => {
     track('share_page_viewed', { status })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Checked once on load (this page has no separate "input stage" the way
+  // onboarding.js does — the notify form is visible, or one tap away, from
+  // the start) so the countdown is already live by the time someone opens
+  // the notify form, not discovered only after they submit it.
+  useEffect(() => {
+    let cancelled = false
+    fetchQuotaStatus().then(status => {
+      if (cancelled || !status) return
+      const serverNowMs = status.serverNow ? new Date(status.serverNow).getTime() : Date.now()
+
+      // Two buckets now (direct + worker) — the countdown reflects
+      // whichever resets LATER, since that's the real binding constraint
+      // for a scan that draws from both. See onboarding.js for the same logic.
+      const msUntilResets = [status.direct?.resetAt, status.worker?.resetAt]
+        .filter(Boolean)
+        .map(resetAt => new Date(resetAt).getTime() - serverNowMs)
+        .filter(ms => ms > 0)
+
+      if (!msUntilResets.length) return
+      const msUntilReset = Math.max(...msUntilResets)
+      setQuotaResetAt(Date.now() + msUntilReset)
+    })
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    if (!quotaResetAt) { setQuotaSecondsLeft(0); return }
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((quotaResetAt - Date.now()) / 1000))
+      setQuotaSecondsLeft(left)
+      if (left <= 0) setQuotaResetAt(null)
+    }
+    tick()
+    const t = setInterval(tick, 1000)
+    return () => clearInterval(t)
+  }, [quotaResetAt])
 
   const handleCopy = (id, text) => {
     navigator.clipboard.writeText(text)
@@ -141,6 +198,10 @@ export default function SharePage({ token, initialStatus, initialData }) {
 
   const handleNotifySubmit = async () => {
     setNotifyError('')
+    if (quotaSecondsLeft > 0) {
+      setNotifyError(`Reddit's shared scan quota is busy right now — available again in ${quotaSecondsLeft}s.`)
+      return
+    }
     const cleanUrl = notifyUrl.startsWith('http') ? notifyUrl : `https://${notifyUrl}`
     if (!notifyUrl.trim() || !isValidUrl(cleanUrl)) {
       setNotifyError('Please enter a valid URL')
@@ -168,11 +229,8 @@ export default function SharePage({ token, initialStatus, initialData }) {
       const productAnalysis = analyzeData.analysis
 
       const subreddits = (productAnalysis.subreddits || ['SaaS', 'indiehackers', 'entrepreneur']).slice(0, 6)
-      const subredditGroups = chunkSubreddits(subreddits)
-      const postArrays = await staggeredMap(
-        subredditGroups, group => fetchSubredditFromBrowser(group, productAnalysis.problemKeywords)
-      )
-      const allPosts = postArrays.flat().filter(p =>
+      const allPostsRaw = await fetchSubredditsDualPath(subreddits)
+      const allPosts = allPostsRaw.filter(p =>
         p.body && p.body.length > 40 &&
         !p.body.includes('submitted by') && !p.body.includes('[link]') && !p.body.includes('[comments]')
       )
@@ -203,6 +261,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
             productName: productAnalysis.name,
             leadCount: qualifiedForFeed.length,
             topScore: Math.max(...qualifiedForFeed.map(l => l.score || 0)),
+            url: cleanUrl,
           }),
         }).catch(() => {})
       }
@@ -487,11 +546,16 @@ export default function SharePage({ token, initialStatus, initialData }) {
                             onChange={e => { setNotifyEmail(e.target.value); setNotifyError('') }}
                             onKeyDown={e => e.key === 'Enter' && handleNotifySubmit()}
                           />
-                          <button className="email-submit" onClick={handleNotifySubmit}>
-                            Notify me
+                          <button className="email-submit" onClick={handleNotifySubmit} disabled={quotaSecondsLeft > 0}>
+                            {quotaSecondsLeft > 0 ? `Available in ${quotaSecondsLeft}s` : 'Notify me'}
                           </button>
                         </div>
                       </>
+                    )}
+                    {quotaSecondsLeft > 0 && !notifyError && (
+                      <p className="ob-error" style={{ color: 'var(--ink-light)' }}>
+                        Reddit's shared scan quota is busy right now — available again in {quotaSecondsLeft}s
+                      </p>
                     )}
                     {notifyError && <p className="ob-error">{notifyError}</p>}
                   </>

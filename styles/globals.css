@@ -950,6 +950,7 @@ input { font-family: var(--font-body); outline: none; }
   box-shadow: 0 4px 20px rgba(192,88,74,0.3);
 }
 .ob-scan-btn:hover { background: var(--rust-dark); transform: translateY(-1px); }
+.ob-scan-btn:disabled { background: var(--ink-muted); cursor: not-allowed; box-shadow: none; transform: none; }
 .ob-examples { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center; }
 .ob-examples span { font-size: 0.85rem; color: var(--ink-muted); }
 .ob-chip {
@@ -1055,6 +1056,7 @@ input { font-family: var(--font-body); outline: none; }
 .email-input:focus { outline: none; border-color: var(--rust); }
 .email-submit { background: var(--rust); color: white; border: none; border-radius: 8px; padding: 12px 20px; font-size: 0.85rem; font-weight: 600; cursor: pointer; white-space: nowrap; transition: background 0.2s; }
 .email-submit:hover { background: var(--rust-dark); }
+.email-submit:disabled { background: var(--ink-muted); cursor: not-allowed; }
 .email-gate-note { font-size: 0.76rem; color: rgba(255,255,255,0.22); }
 .email-success { background: rgba(76,175,80,0.08); border: 1px solid rgba(76,175,80,0.2); border-radius: 16px; padding: 24px; display: flex; align-items: center; gap: 16px; }
 .email-success-icon { font-size: 2rem; flex-shrink: 0; }
@@ -1932,6 +1934,21 @@ input { font-family: var(--font-body); outline: none; }
 }
 .notif-reminder-btn:disabled { opacity: 0.6; cursor: default; }
 .notif-reminder-error { flex-basis: 100%; font-size: 0.78rem; color: var(--rust); }
+
+.held-reminder-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  background: var(--cream-dark);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin: 16px 0;
+  font-size: 0.85rem;
+  color: var(--ink);
+}
+.held-reminder-banner span { flex: 1; min-width: 200px; }
 
 .dash-empty-profile {
   display: flex;
@@ -2972,6 +2989,32 @@ input { font-family: var(--font-body); outline: none; }
   white-space: normal;
   overflow-wrap: anywhere;
 }
+.admin-user-held-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.62rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--rust-muted);
+  color: var(--rust);
+  vertical-align: middle;
+}
+.admin-user-hold-btn {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.76rem;
+  background: var(--cream);
+  font-family: var(--font-body);
+  color: var(--ink-light);
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.admin-user-hold-btn:hover { border-color: var(--rust-border); color: var(--rust); }
 
 .admin-user-row-wrap { display: flex; flex-direction: column; }
 .admin-user-expand-btn {

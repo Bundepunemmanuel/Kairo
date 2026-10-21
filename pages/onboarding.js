@@ -66,15 +66,25 @@ function parseAtom(xml, defaultSubreddit) {
 // `subs` may be a single subreddit name or several joined with "+" (a
 // Reddit multireddit) — encodeURIComponent turns "+" into "%2B", which
 // survives the round trip to our own /api/reddit and decodes back to a
-// literal "+" there, which reddit.js then re-splits for the outbound
-// Reddit request. parseAtom no longer needs this value for tagging each
-// post's subreddit (each entry carries its own via <category> now) — it's
-// only kept as a last-resort fallback if that tag is ever missing.
-async function fetchSubredditFromBrowser(subs, keywords) {
+// literal "+" there. parseAtom no longer needs this value for tagging
+// each post's subreddit (each entry carries its own via <category> now)
+// — it's only kept as a last-resort fallback if that tag is ever missing.
+//
+// source='direct' (default) or 'worker' — passed through to /api/reddit's
+// own source param, which decides whether that request goes to Reddit
+// straight from this app's own path or through the Cloudflare Worker
+// proxy (a separate IP with its own independent quota bucket — see
+// reddit.js's WORKER_BASE_URL comment). Which subreddits use which source
+// is decided by the caller below, not here.
+async function fetchSubredditFromBrowser(subs, source = 'direct') {
   try {
-    const kw = Array.isArray(keywords) && keywords.length ? `&keywords=${encodeURIComponent(keywords.join(','))}` : ''
+    // No keywords param — reddit.js no longer reads one (week-search via
+    // Reddit's search endpoint was tried, then reversed; not coming back).
+    // problemKeywords itself still exists on the analysis object — it's
+    // kept for /api/debug-scan.js and /debug — this just stops being one
+    // of its uses.
     const res = await fetch(
-      `/api/reddit?sub=${encodeURIComponent(subs)}&sort=new${kw}`,
+      `/api/reddit?sub=${encodeURIComponent(subs)}&sort=new&source=${source}`,
       { signal: AbortSignal.timeout(10000) }
     )
     if (!res.ok) return []
@@ -86,37 +96,45 @@ async function fetchSubredditFromBrowser(subs, keywords) {
   }
 }
 
-// Splits subreddits into groups — each group becomes one combined
-// multireddit request. Was groupSize 3 (6 subreddits → 2 requests), raised
-// to 6 (→ 1 request) after production logs showed the real cause of the
-// 429s: Reddit's X-Ratelimit-Remaining hit 0.0 after a single request, so
-// it was always the *second* request in a scan that failed, every time —
-// not a volume/reputation issue. One request per scan means that failure
-// mode can't happen. The tradeoff this gives up: an uneven split across
-// very different subreddits isn't guaranteed (Reddit returns top-N by sort
-// order across the merged set, not an even share per subreddit), and a
-// single blocked request now loses the whole scan's data with no partial
-// fallback — acceptable since the alternative (2 requests) was reliably
-// losing half the data anyway.
-function chunkSubreddits(subs, groupSize = 6) {
-  const groups = []
-  for (let i = 0; i < subs.length; i += groupSize) groups.push(subs.slice(i, i + groupSize).join('+'))
-  return groups
+// ─── Shared Reddit quota status ─────────────────────────────────────────
+// Reads the rate-limit reset time(s) persisted by reddit.js (mode=status)
+// — a plain Supabase read, not an outbound Reddit request, so checking
+// this never costs part of the shared quota itself. Returns both the
+// direct and worker buckets; used to show visitors a countdown instead of
+// letting them scan straight into a guaranteed 429 on either path.
+async function fetchQuotaStatus() {
+  try {
+    const res = await fetch('/api/reddit?mode=status', { signal: AbortSignal.timeout(5000) })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
 }
 
-// Fetches sequentially with a gap between each, instead of firing every
-// subreddit at once via Promise.all. Originally sized (400ms) for when
-// requests went direct to Reddit from Vercel's IP and got reliably
-// rate-limited; now that /api/reddit.js routes through a Cloudflare Worker
-// instead, shrunk but kept rather than removed — no need to re-test that
-// boundary aggressively on day one of a brand-new proxy.
-async function staggeredMap(items, fn, delayMs = 150) {
-  const results = []
-  for (let i = 0; i < items.length; i++) {
-    results.push(await fn(items[i], i))
-    if (i < items.length - 1) await new Promise(r => setTimeout(r, delayMs))
-  }
-  return results
+// Splits up to 6 subreddits into two halves of up to 3 — one fetched
+// directly, one through the Cloudflare Worker proxy, two genuinely
+// separate IPs with independent quota buckets (confirmed separately).
+// Fetched CONCURRENTLY, not staggered: the old staggeredMap existed to
+// pace requests against each other under one shared quota, but direct and
+// worker don't share anything, so there's nothing to pace them against —
+// staggering them would only add latency for no reason. Replaces the
+// previous chunkSubreddits (groupSize 6 → one combined request) now that
+// a single request has become two, one per path.
+async function fetchSubredditsDualPath(subreddits) {
+  const directSubs = subreddits.slice(0, 3)
+  const workerSubs = subreddits.slice(3, 6)
+
+  const [directPosts, workerPosts] = await Promise.all([
+    directSubs.length ? fetchSubredditFromBrowser(directSubs.join('+'), 'direct') : Promise.resolve([]),
+    workerSubs.length ? fetchSubredditFromBrowser(workerSubs.join('+'), 'worker') : Promise.resolve([]),
+  ])
+
+  // The worker is a bonus, not a hard dependency — if it fails or comes
+  // back empty, the scan proceeds with whatever direct returned rather
+  // than failing the whole thing.
+  console.log(`[onboarding] direct ${directPosts.length} posts, worker ${workerPosts.length} posts`)
+  return [...directPosts, ...workerPosts]
 }
 
 // ─── Component ────────────────────────────────────────────────────────────
@@ -138,6 +156,12 @@ export default function Onboarding() {
   const [scanStats, setScanStats] = useState(null) // { postsScanned, subreddits }
   const [replies, setReplies] = useState({}) // { [leadId]: reply text }
   const [replyLoading, setReplyLoading] = useState({}) // { [leadId]: true/false }
+
+  // ── Shared Reddit quota countdown ──
+  // quotaResetAt is a local (client-clock) epoch ms timestamp, or null
+  // when the shared quota is open. Null means "go ahead and scan."
+  const [quotaResetAt, setQuotaResetAt] = useState(null)
+  const [quotaSecondsLeft, setQuotaSecondsLeft] = useState(0)
 
   // ── Zero-results capture (email + push, no signup form) ──
   const [captureEmail, setCaptureEmail] = useState('')
@@ -244,6 +268,48 @@ export default function Onboarding() {
     return () => clearInterval(t)
   }, [stage])
 
+  // Check the shared Reddit quota as soon as someone lands on the input
+  // stage, so the countdown (if any) is visible before they ever touch the
+  // URL field — not discovered only after they click and the scan fails.
+  //
+  // A scan now draws from TWO buckets (direct + worker, see
+  // fetchSubredditsDualPath), so the countdown has to reflect whichever
+  // one resets LATER — that's the real binding constraint, since the scan
+  // can't get a full result until both paths are open, not just one.
+  useEffect(() => {
+    if (stage !== 'input') return
+    let cancelled = false
+    fetchQuotaStatus().then(status => {
+      if (cancelled || !status) return
+      const serverNowMs = status.serverNow ? new Date(status.serverNow).getTime() : Date.now()
+
+      const msUntilResets = [status.direct?.resetAt, status.worker?.resetAt]
+        .filter(Boolean)
+        .map(resetAt => new Date(resetAt).getTime() - serverNowMs)
+        .filter(ms => ms > 0)
+
+      if (!msUntilResets.length) return
+      const msUntilReset = Math.max(...msUntilResets)
+      setQuotaResetAt(Date.now() + msUntilReset)
+    })
+    return () => { cancelled = true }
+  }, [stage])
+
+  // Ticks quotaSecondsLeft down to 0 once quotaResetAt is set, then clears
+  // itself — this is what drives both the disabled scan button and the
+  // "available in Xs" copy below.
+  useEffect(() => {
+    if (!quotaResetAt) { setQuotaSecondsLeft(0); return }
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((quotaResetAt - Date.now()) / 1000))
+      setQuotaSecondsLeft(left)
+      if (left <= 0) setQuotaResetAt(null)
+    }
+    tick()
+    const t = setInterval(tick, 1000)
+    return () => clearInterval(t)
+  }, [quotaResetAt])
+
   useEffect(() => {
     if (!leads.length) return
     const init = {}
@@ -278,6 +344,13 @@ export default function Onboarding() {
   }
 
   const handleScan = async () => {
+    // Belt-and-suspenders alongside the disabled button below — this also
+    // covers the Enter-key submit path, which doesn't go through the
+    // button's disabled attribute.
+    if (quotaSecondsLeft > 0) {
+      setError(`Reddit's shared scan quota is busy right now — available again in ${quotaSecondsLeft}s.`)
+      return
+    }
     if (!url.trim()) { setError('Please enter your website URL'); return }
     const clean = url.startsWith('http') ? url : `https://${url}`
     if (!isValidUrl(clean)) { setError('Please enter a valid URL'); return }
@@ -326,15 +399,14 @@ export default function Onboarding() {
       setAnalysis(productAnalysis)
 
       // ── Step 2: Fetch Reddit posts from browser (avoids server-side blocking)
-      // problemKeywords (from analyze.js) bounds this to the last 7 days via
-      // Reddit's search endpoint instead of whatever happens to be newest
-      // right now — see /api/reddit.js for the fallback if search is empty.
+      // Two concurrent requests now — up to 3 subreddits direct, up to 3
+      // through the Cloudflare Worker proxy — instead of one combined
+      // request for all 6, since direct and worker draw from separate
+      // quota buckets (see fetchSubredditsDualPath above). No
+      // keywords/search-window param, see fetchSubredditFromBrowser above.
       const subreddits = (productAnalysis.subreddits || ['SaaS', 'indiehackers', 'entrepreneur']).slice(0, 6)
-      const subredditGroups = chunkSubreddits(subreddits)
-      const postArrays = await staggeredMap(
-        subredditGroups, group => fetchSubredditFromBrowser(group, productAnalysis.problemKeywords)
-      )
-      const allPosts = postArrays.flat().filter(p =>
+      const allPostsRaw = await fetchSubredditsDualPath(subreddits)
+      const allPosts = allPostsRaw.filter(p =>
         p.body &&
         p.body.length > 40 &&
         !p.body.includes('submitted by') &&
@@ -390,6 +462,7 @@ export default function Onboarding() {
             productName: productAnalysis.name,
             leadCount: qualifiedForFeed.length,
             topScore: Math.max(...qualifiedForFeed.map(l => l.score || 0)),
+            url: clean,
           }),
         }).catch(() => {})
       }
@@ -643,8 +716,13 @@ export default function Onboarding() {
                   />
                 </div>
                 {error && <p className="ob-error">{error}</p>}
-                <button className="ob-scan-btn" onClick={handleScan}>
-                  Find My Customers →
+                {quotaSecondsLeft > 0 && (
+                  <p className="ob-error" style={{ color: 'var(--ink-light)' }}>
+                    Reddit's shared scan quota is busy right now — available again in {quotaSecondsLeft}s
+                  </p>
+                )}
+                <button className="ob-scan-btn" onClick={handleScan} disabled={quotaSecondsLeft > 0}>
+                  {quotaSecondsLeft > 0 ? `Available in ${quotaSecondsLeft}s` : 'Find My Customers →'}
                 </button>
               </div>
 
