@@ -398,6 +398,18 @@ Posts: ${JSON.stringify(input)}`,
     rated.filter(r => typeof r.i === 'number').map(r => [r.i, Number(r.r) || 0])
   )
 
+  // Pairs each post's own title with its index and rating — the raw
+  // model-output log above (just {"i":5,"r":4} pairs) gave no way to
+  // check a rating against what the post actually said. "(unrated)"
+  // marks an index the model skipped despite instructions, which still
+  // fails open to r=10 below, same as a parse failure does for the whole
+  // batch.
+  sample.forEach((p, i) => {
+    const r = relevance.has(i) ? relevance.get(i) : 10
+    const unrated = relevance.has(i) ? '' : ' (unrated, failed open)'
+    console.log(`[score:pass1] i=${i} r=${r}${unrated} — "${(p.title || '').slice(0, 80)}"`)
+  })
+
   // Unrated indices (the model skipped one despite instructions) fail open
   // too, same reasoning as a parse failure above — treated as relevant
   // rather than silently dropped.
