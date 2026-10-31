@@ -479,7 +479,15 @@ async function sweepPushEngagement() {
 const WATCHLIST_BATCH_SIZE = 3
 
 async function runWatchlistScan(): Promise<Response> {
-  console.log('[watchlist-scan] starting slice at', new Date().toISOString())
+  const startedAt = new Date().toISOString()
+  console.log('[watchlist-scan] starting slice at', startedAt)
+
+  // Heartbeat, stamped FIRST, before any other work — this is what lets
+  // the admin panel tell "actually running" apart from "is_running is
+  // stuck true because the chain died somewhere." Deliberately a
+  // separate write from the is_running/cancel_requested updates below,
+  // so it lands even on an invocation that immediately bails out.
+  await supabase.from('watchlist_control').update({ last_activity_at: startedAt }).eq('id', 'global')
 
   try {
     const { data: control } = await supabase
@@ -530,6 +538,7 @@ async function runWatchlistScan(): Promise<Response> {
       }
 
       const item = pendingItems[i]
+      await supabase.from('watchlist_control').update({ last_activity_at: new Date().toISOString() }).eq('id', 'global')
       await processWatchlistItem(item)
       processed++
     }
