@@ -1,8 +1,9 @@
 // og.js — Generates the image shown in link previews (Slack, Twitter,
 // iMessage, etc). Two modes:
-//   ?token=xxx  → a dark card built from that share: how many people were
-//                 found, the product name, and the top-scoring lead's real
-//                 post title with its score, stacked over the other matches
+//   ?token=xxx  → a dark card built from that share: a giant number of how
+//                 many people were found, the product name, and the
+//                 top-scoring lead's real post title with its score, on a
+//                 card stacked over the other matches
 //   no token, an expired/unknown one, or a share with no qualified leads
 //                 → a generic branded fallback, no fabricated numbers
 //
@@ -24,12 +25,13 @@ const RUST = '#c0584a'
 const RUST_TEXT = '#8a3b2c'
 const RUST_BG = 'rgba(192,88,74,0.12)'
 
-// Reply windows mirror score.js (active demand 3h, passive 6h, counted
-// from when the post went up) and the same copy in pages/share/[token].js —
-// keep all three in sync. Used only to decide whether the card may carry
-// urgency copy: with the 7-day search window, many leads are already past
-// their window, and "go cold in hours" must not imply those are fresh.
-const windowMinutes = lead => (lead.signalType === 'active' ? 180 : 360)
+// Reply window mirrors score.js (flat 24h, counted from when the post
+// went up, i.e. lead.createdAt) and the same copy in
+// pages/share/[token].js — keep all three in sync. Used only to decide
+// whether the card may carry urgency copy: with the 7-day search window,
+// many leads are already past their window, and the urgency copy must not
+// imply those are fresh.
+const windowMinutes = () => 1440
 const isInsideWindow = lead => {
   if (!lead.createdAt) return false
   return (Date.now() - lead.createdAt) / 60000 < windowMinutes(lead)
@@ -81,55 +83,66 @@ export default async function handler(req) {
     const top = [...qualified].sort((a, b) => (b.score || 0) - (a.score || 0))[0]
     const urgent = qualified.some(isInsideWindow)
     const name = clip(shareData.analysis?.name || 'this product', 22)
-    const subject = `${n} ${n === 1 ? 'person' : 'people'} on Reddit${urgent ? '' : ' this week'} ${n === 1 ? 'has' : 'have'} the problem`
     const score = Math.round(Math.min(100, Math.max(0, top.score || 0)))
     const circumference = 2 * Math.PI * 26
     const offset = circumference * (1 - score / 100)
     const behind = Math.min(n - 1, 2) // cards peeking out behind the top lead
+    // How far the back-most visible card is offset, so the "+N more"
+    // label can sit just past it without depending on which of the two
+    // peek layers is actually rendered.
+    const backOffset = behind >= 2 ? 64 : behind >= 1 ? 32 : 0
 
     return new ImageResponse(
       (
         <div style={{
           width: '100%', height: '100%', display: 'flex', flexDirection: 'column',
-          background: INK, padding: '52px 72px 0',
+          background: INK, padding: '46px 72px 0',
         }}>
           <Logo textColor={CREAM} origin={origin} />
 
-          <div style={{ display: 'flex', alignItems: 'center', marginTop: 26, height: 400 }}>
-            <div style={{ display: 'flex', flexDirection: 'column', width: 540, marginRight: 56 }}>
-              <div style={{ display: 'flex', fontSize: 46, fontWeight: 700, color: CREAM, lineHeight: 1.18 }}>
-                {subject}
+          {/* Giant number + stacked overlapping cards. Kept inside a
+              380px-tall row starting ~98px down, so everything here ends
+              well above the bottom ~130px X reserves for its caption
+              overlay (see the layout note up top). */}
+          <div style={{ display: 'flex', alignItems: 'center', marginTop: 18, height: 380 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', width: 460, marginRight: 40 }}>
+              <div style={{ display: 'flex', fontSize: 196, fontWeight: 800, color: RUST, lineHeight: 0.8 }}>
+                {n}
               </div>
-              <div style={{ display: 'flex', fontSize: 46, fontWeight: 700, color: RUST, lineHeight: 1.18 }}>
+              <div style={{ display: 'flex', fontSize: 30, fontWeight: 700, color: CREAM, lineHeight: 1.26, marginTop: 10 }}>
+                {n === 1 ? 'person' : 'people'} on Reddit{urgent ? '' : ' this week'} {n === 1 ? 'has' : 'have'} the problem
+              </div>
+              <div style={{ display: 'flex', fontSize: 30, fontWeight: 700, color: RUST, lineHeight: 1.26 }}>
                 {name} solves
               </div>
               {urgent && (
                 <div style={{
-                  display: 'flex', alignSelf: 'flex-start', marginTop: 26, fontSize: 21,
-                  padding: '9px 22px', borderRadius: 30,
+                  display: 'flex', alignSelf: 'flex-start', marginTop: 20, fontSize: 19,
+                  padding: '8px 20px', borderRadius: 30,
                   background: 'rgba(192,88,74,0.2)', color: '#e79684',
                 }}>
-                  Leads like these go cold in 3–6 hours
+                  Leads like these go cold in 24 hours
                 </div>
               )}
             </div>
 
-            <div style={{ display: 'flex', position: 'relative', width: 460, height: 326 }}>
+            <div style={{ display: 'flex', position: 'relative', width: 480, height: 370 }}>
               {behind >= 2 && (
                 <div style={{
-                  position: 'absolute', display: 'flex', left: 28, top: 30, width: 424, height: 250,
-                  background: CREAM, opacity: 0.22, borderRadius: 18,
+                  position: 'absolute', display: 'flex', left: 64, top: 56, width: 400, height: 270,
+                  background: CREAM, opacity: 0.16, borderRadius: 20, transform: 'rotate(5deg)',
                 }} />
               )}
               {behind >= 1 && (
                 <div style={{
-                  position: 'absolute', display: 'flex', left: 14, top: 15, width: 424, height: 250,
-                  background: CREAM, opacity: 0.45, borderRadius: 18,
+                  position: 'absolute', display: 'flex', left: 32, top: 28, width: 400, height: 270,
+                  background: CREAM, opacity: 0.36, borderRadius: 20, transform: 'rotate(2.5deg)',
                 }} />
               )}
               <div style={{
                 position: 'absolute', display: 'flex', flexDirection: 'column', left: 0, top: 0,
-                width: 424, height: 250, background: CREAM, borderRadius: 18, padding: '22px 24px',
+                width: 400, height: 270, background: CREAM, borderRadius: 20, padding: '24px 26px',
+                boxShadow: '0 18px 40px rgba(0,0,0,0.35)',
               }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <div style={{
@@ -152,14 +165,14 @@ export default async function handler(req) {
                     <div style={{ display: 'flex', fontSize: 22, fontWeight: 700, color: RUST_TEXT }}>{score}</div>
                   </div>
                 </div>
-                <div style={{ display: 'flex', marginTop: 14, fontSize: 27, fontWeight: 700, color: INK, lineHeight: 1.3 }}>
-                  {clip(top.title || '', 96)}
+                <div style={{ display: 'flex', marginTop: 16, fontSize: 26, fontWeight: 700, color: INK, lineHeight: 1.3 }}>
+                  {clip(top.title || '', 90)}
                 </div>
               </div>
               {behind > 0 && (
                 <div style={{
-                  position: 'absolute', display: 'flex', right: 0, bottom: 0,
-                  fontSize: 21, color: 'rgba(245,240,235,0.6)',
+                  position: 'absolute', display: 'flex', left: backOffset, top: backOffset + 270 + 14,
+                  fontSize: 20, color: 'rgba(245,240,235,0.55)',
                 }}>
                   +{n - 1} more {n - 1 === 1 ? 'match' : 'matches'}
                 </div>

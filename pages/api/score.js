@@ -631,7 +631,12 @@ export default async function handler(req, res) {
 
     const toLead = ({ post, score, signalType, specificProblem, reason, tier }) => {
       const ageMinutes = (Date.now() - (post.createdAt || Date.now())) / 60000
-      const maxWindow = signalType === 'active' ? 180 : 360
+      // Flat 24h expiry, measured from the Reddit post's own published
+      // date (post.createdAt), not from when Kairo scanned or scored it.
+      // Previously active/passive signals had separate 180/360-minute
+      // windows — kept in sync with the same copy of this calculation in
+      // share/[token].js, og.js, and dashboard.js.
+      const maxWindow = 1440
       return {
         ...post,
         score,

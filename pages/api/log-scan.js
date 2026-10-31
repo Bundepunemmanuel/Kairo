@@ -71,17 +71,12 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, action: 'inserted' })
     }
 
-    // Only update when the new scan is actually BETTER — a weaker
-    // re-scan (fewer or lower-scoring leads this time, e.g. because posts
-    // simply aged out) shouldn't make the ticker regress on something it
-    // already showed for this product.
-    if (cleanTopScore <= existing.top_score) {
-      return res.status(200).json({ ok: true, action: 'unchanged' })
-    }
-
-    // created_at bumped to now on a real update, so the ticker's ordering
-    // reflects when the best result was actually found, not just when
-    // this product first ever got scanned.
+    // Every re-scan refreshes the row — created_at bumped to now so the
+    // ticker's ordering always reflects the most recent scan for this
+    // product, not just whichever scan happened to find the best score.
+    // (Previously this only updated when the new top score beat the old
+    // one, which let a same-or-lower-scoring re-scan leave a stale entry
+    // sitting at the top of the ticker.)
     const { error: updateErr } = await supabaseAdmin
       .from('scan_feed')
       .update({

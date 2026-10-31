@@ -111,12 +111,12 @@ const isValidUrl = str => {
   catch { return false }
 }
 
-// Reply windows mirror score.js (active demand 3h, passive 6h, counted from
-// when the post went up) and the same copy in pages/api/og.js — keep all
+// Reply window mirrors score.js (flat 24h, counted from when the post went
+// up, i.e. lead.createdAt) and the same copy in pages/api/og.js — keep all
 // three in sync. Only used to decide whether the link-preview caption may
 // carry urgency copy: with the 7-day search window, many leads are already
-// past their window, so "go cold in hours" must not imply those are fresh.
-const windowMinutes = lead => (lead.signalType === 'active' ? 180 : 360)
+// past their window, so "go cold" copy must not imply those are fresh.
+const windowMinutes = () => 1440
 const isInsideWindow = lead => {
   if (!lead.createdAt) return false
   return (Date.now() - lead.createdAt) / 60000 < windowMinutes(lead)
@@ -357,7 +357,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
   // caption when a share has no qualified leads (the image falls back too).
   const shareCount = qualified.length
   const cardCaption = shareCount > 0
-    ? `${analysis.name} — ${shareCount} ${shareCount === 1 ? 'person' : 'people'} on Reddit ${shareCount === 1 ? 'needs' : 'need'} this.${qualified.some(isInsideWindow) ? ' Leads go cold in hours.' : ''}`
+    ? `${analysis.name} — ${shareCount} ${shareCount === 1 ? 'person' : 'people'} on Reddit ${shareCount === 1 ? 'needs' : 'need'} this.${qualified.some(isInsideWindow) ? ' Leads go cold in 24 hours.' : ''}`
     : `${analysis.name} — Leads found by Kairo`
 
   return (

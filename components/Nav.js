@@ -22,8 +22,6 @@ export default function Nav({ solid = false }) {
     <>
       {/* Announcement */}
       <div className="announcement">
-        <span>🔴 Try the live demo free</span>
-        <span style={{ opacity: 0.4 }}>·</span>
         <span>Sign up free to scan automatically every day.</span>
       </div>
 

@@ -62,7 +62,10 @@ export default function Dashboard() {
       const next = {}
       activeLeads.forEach(l => {
         const ageMinutes = (Date.now() - (l.created_at_post || Date.now())) / 60000
-        const maxWindow = l.signal_type === 'active' ? 180 : 360
+        // Flat 24h expiry based on the Reddit post's own published date
+        // (created_at_post) — kept in sync with score.js, og.js and
+        // share/[token].js's copies of this same calculation.
+        const maxWindow = 1440
         next[l.id] = maxWindow - ageMinutes
       })
       return next
