@@ -32,13 +32,14 @@ const UNLIMITED_EMAIL = 'bundepunemmanuel@gmail.com'
 // Next.js app just to ask what it already wrote to the same database.
 //
 // source distinguishes which quota bucket to wait on — 'direct' (this
-// app's own egress, row id 'direct') or 'worker' (the Cloudflare Worker's
-// separate IP, row id 'worker') — two independent buckets, not one shared
-// one, since the whole point of the worker is that it resets on its own
-// clock. Waiting on the wrong one would either wait too long (checking
-// 'direct' before a worker-routed fetch) or not long enough (checking
-// nothing at all).
-async function waitForRedditQuota(source: 'direct' | 'worker' = 'direct') {
+// app's own egress, row id 'direct'), 'worker' (the live-traffic
+// Cloudflare Worker's separate IP, row id 'worker'), or 'watchlist-worker'
+// (the admin batch's own dedicated Worker, row id 'watchlist-worker') —
+// three independent buckets, not one shared one, since the whole point of
+// each worker is that it resets on its own clock. Waiting on the wrong
+// one would either wait too long (checking 'direct' before a worker-
+// routed fetch) or not long enough (checking nothing at all).
+async function waitForRedditQuota(source: 'direct' | 'worker' | 'watchlist-worker' = 'direct') {
   const { data, error } = await supabase
     .from('reddit_rate_limit')
     .select('reset_at')
@@ -70,12 +71,13 @@ async function waitForRedditQuota(source: 'direct' | 'worker' = 'direct') {
 // one combined request instead of one per subreddit (see the main handler
 // below), matching onboarding.js / share/[token].js.
 //
-// source='direct' (default) or 'worker' — passed straight through to
-// /api/reddit.js's own source param, which decides whether that request
-// goes to Reddit directly or through the Cloudflare Worker proxy. The
-// caller (the main handler below) is what decides which subreddits go
-// through which path.
-async function fetchSubreddit(subreddit: string, source: 'direct' | 'worker' = 'direct') {
+// source='direct' (default), 'worker', or 'watchlist-worker' — passed
+// straight through to /api/reddit.js's own source param, which decides
+// whether that request goes to Reddit directly or through one of the two
+// Cloudflare Worker proxies. The caller (the main handler, or
+// runWatchlistScan below) is what decides which subreddits go through
+// which path.
+async function fetchSubreddit(subreddit: string, source: 'direct' | 'worker' | 'watchlist-worker' = 'direct') {
   try {
     const res = await fetch(
       `${NEXTJS_BASE_URL}/api/reddit?sub=${encodeURIComponent(subreddit)}&sort=new&source=${source}`,
@@ -134,12 +136,18 @@ function parseAtom(xml: string, defaultSubreddit: string) {
 }
 
 // ─── Scoring — calls existing Next.js /api/score route ──────────────────
-async function scorePosts(posts: any[], analysis: any) {
+// includeCloseMatches defaults to false, matching the main loop's existing
+// behavior exactly (it only ever wanted qualified leads). The watchlist
+// batch (runWatchlistScan below) passes true, same as onboarding.js does,
+// since save-share.js's `leads` array is meant to hold everything (qualified
+// + close), with qualified-vs-close filtering happening at display/count
+// time, not at save time.
+async function scorePosts(posts: any[], analysis: any, includeCloseMatches = false) {
   try {
     const res = await fetch(`${NEXTJS_BASE_URL}/api/score`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ posts, analysis }),
+      body: JSON.stringify({ posts, analysis, includeCloseMatches }),
       signal: AbortSignal.timeout(30000),
     })
     const data = await res.json()
@@ -443,6 +451,211 @@ async function sweepPushEngagement() {
   }
 }
 
+// ─── Admin X-lead watchlist batch (#4) ───────────────────────────────────
+// Routed here by ?task=watchlist-scan, triggered by the admin panel's Run
+// button (via schedule_watchlist_followup with run_at a few seconds out —
+// see pages/api/admin.js's 'watchlist-run' action) and then self-
+// scheduling its own follow-up slices the same way, under its own pg_cron
+// job name, deliberately separate from the main loop's own
+// schedule_followup_batch/job name below.
+//
+// Mirrors the main loop's own direct/worker split (see the subreddit
+// split comment further down in Deno.serve), but swaps the live-traffic
+// 'worker' bucket for the dedicated 'watchlist-worker' bucket — the whole
+// point being this batch never competes with real visitors for the
+// 'worker' quota. It only shares 'direct' with live traffic, which is
+// unavoidable (single Vercel egress IP).
+//
+// Self-reschedules via schedule_watchlist_followup (see phase2-schema.sql),
+// a dedicated RPC scheduled under its own pg_cron job name
+// ('kairo-watchlist-followup') rather than reusing schedule_followup_batch
+// — that RPC's own comment elsewhere in this file says it "upserts" its
+// job, which would mean a single fixed job name shared across every
+// caller. Two self-rescheduling chains (this one and the main loop below)
+// both landing on that one name around the same time could silently
+// overwrite each other's pending follow-up. schedule_watchlist_followup
+// sidesteps that entirely by never touching whatever name the original
+// RPC uses.
+const WATCHLIST_BATCH_SIZE = 3
+
+async function runWatchlistScan(): Promise<Response> {
+  console.log('[watchlist-scan] starting slice at', new Date().toISOString())
+
+  try {
+    const { data: control } = await supabase
+      .from('watchlist_control')
+      .select('cancel_requested')
+      .eq('id', 'global')
+      .maybeSingle()
+
+    if (control?.cancel_requested) {
+      console.log('[watchlist-scan] cancel_requested was set before this slice started — stopping, not processing anything')
+      await supabase.from('watchlist_control').update({ is_running: false, cancel_requested: false, updated_at: new Date().toISOString() }).eq('id', 'global')
+      return new Response(JSON.stringify({ cancelled: true, processed: 0 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    const { data: pendingItems, error: pendingErr } = await supabase
+      .from('watchlist_items')
+      .select('id, product_url, x_post_url')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+      .limit(WATCHLIST_BATCH_SIZE)
+
+    if (pendingErr) throw pendingErr
+
+    if (!pendingItems?.length) {
+      console.log('[watchlist-scan] no pending items — marking not running')
+      await supabase.from('watchlist_control').update({ is_running: false, updated_at: new Date().toISOString() }).eq('id', 'global')
+      return new Response(JSON.stringify({ processed: 0, message: 'queue empty' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    let processed = 0
+    let cancelledMidSlice = false
+
+    for (let i = 0; i < pendingItems.length; i++) {
+      // Checked before EVERY item, not just once at the top of this
+      // invocation — a cancel requested while item 1 of 3 was still
+      // mid-flight must not let items 2 and 3 start, but must also never
+      // abort item 1 itself partway through (that's what "not just the
+      // start" + "doesn't leave an item half-processed" both require).
+      const { data: freshControl } = await supabase
+        .from('watchlist_control')
+        .select('cancel_requested')
+        .eq('id', 'global')
+        .maybeSingle()
+      if (freshControl?.cancel_requested) {
+        console.log(`[watchlist-scan] cancel detected before item ${i + 1}/${pendingItems.length} — stopping this slice here`)
+        cancelledMidSlice = true
+        break
+      }
+
+      const item = pendingItems[i]
+      await processWatchlistItem(item)
+      processed++
+    }
+
+    if (cancelledMidSlice) {
+      await supabase.from('watchlist_control').update({ is_running: false, cancel_requested: false, updated_at: new Date().toISOString() }).eq('id', 'global')
+      return new Response(JSON.stringify({ processed, cancelled: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    const { count: remainingPending } = await supabase
+      .from('watchlist_items')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'pending')
+
+    if ((remainingPending || 0) > 0) {
+      const nextRunAt = new Date(Date.now() + 2 * 60 * 1000)
+      console.log(`[watchlist-scan] ${remainingPending} item(s) still pending — scheduling next slice at ${nextRunAt.toISOString()}`)
+      const { error: scheduleErr } = await supabase.rpc('schedule_watchlist_followup', {
+        target_url: `${SUPABASE_URL}/functions/v1/cron-scan?task=watchlist-scan`,
+        auth_header: `Bearer ${SERVICE_ROLE_KEY}`,
+        run_at: nextRunAt.toISOString(),
+      })
+      if (scheduleErr) console.log('[watchlist-scan] failed to schedule next slice:', scheduleErr.message)
+    } else {
+      console.log('[watchlist-scan] queue empty after this slice — done')
+      await supabase.from('watchlist_control').update({ is_running: false, updated_at: new Date().toISOString() }).eq('id', 'global')
+    }
+
+    return new Response(
+      JSON.stringify({ processed, remainingPending: remainingPending || 0 }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    )
+  } catch (err: any) {
+    console.error('[watchlist-scan] fatal error:', err.message)
+    // Leave is_running true on a fatal error rather than silently clearing
+    // it — an admin staring at a stuck "Running..." state is a much
+    // louder, more honest signal that something broke than a batch that
+    // quietly looks finished when it isn't.
+    return new Response(JSON.stringify({ error: err.message }), { status: 500 })
+  }
+}
+
+async function processWatchlistItem(item: { id: string; product_url: string; x_post_url: string }) {
+  const { id, product_url } = item
+  const mark = async (fields: Record<string, any>) =>
+    supabase.from('watchlist_items').update({ ...fields, updated_at: new Date().toISOString() }).eq('id', id)
+
+  try {
+    await mark({ status: 'scanning', error_message: null })
+
+    // Step 1: analyze — same /api/analyze route used everywhere else.
+    const analysis = await reanalyzeProduct(product_url)
+    if (!analysis) {
+      await mark({ status: 'error', error_message: 'Could not analyze this product URL (all AI providers failed or returned a fallback)' })
+      return
+    }
+
+    const subreddits = (analysis.subreddits || []).slice(0, 6)
+    if (!subreddits.length) {
+      await mark({ status: 'error', error_message: 'Analysis returned no subreddits to scan' })
+      return
+    }
+
+    // Step 2: fetch — direct + watchlist-worker split, same pattern as the
+    // main loop's direct + worker split (see Deno.serve below), just with
+    // the dedicated watchlist worker instead of the live-traffic one.
+    const directSubs = subreddits.slice(0, 3)
+    const watchlistWorkerSubs = subreddits.slice(3, 6)
+
+    await Promise.all([
+      directSubs.length ? waitForRedditQuota('direct') : Promise.resolve(),
+      watchlistWorkerSubs.length ? waitForRedditQuota('watchlist-worker') : Promise.resolve(),
+    ])
+
+    const [directPosts, workerPosts] = await Promise.all([
+      directSubs.length ? fetchSubreddit(directSubs.join('+'), 'direct') : Promise.resolve([] as any[]),
+      watchlistWorkerSubs.length ? fetchSubreddit(watchlistWorkerSubs.join('+'), 'watchlist-worker') : Promise.resolve([] as any[]),
+    ])
+
+    console.log(`[watchlist-scan] item ${id}: direct ${directPosts.length} posts, watchlist-worker ${workerPosts.length} posts`)
+    const combinedPosts = [...directPosts, ...workerPosts]
+    const freshPosts = combinedPosts.filter((p: any) => p.body && p.body.length > 40)
+
+    if (!freshPosts.length) {
+      await mark({ status: 'error', error_message: 'No Reddit posts found across this product\u2019s matched subreddits' })
+      return
+    }
+
+    // Step 3: score — existing /api/score flow, unchanged, with
+    // includeCloseMatches so save-share gets the same full leads array
+    // onboarding.js's own Save & Share button would produce.
+    const { leads: scoredLeads } = await scorePosts(freshPosts, analysis, true)
+
+    if (!scoredLeads.length) {
+      await mark({ status: 'error', error_message: 'No matching leads found for this product right now' })
+      return
+    }
+
+    // Step 4: save-share — hands back the /share/<token> link to reply
+    // with. qualified (non-'close') count/top-score mirrors how the
+    // ticker and share page itself report these numbers elsewhere.
+    const shareRes = await fetch(`${NEXTJS_BASE_URL}/api/save-share`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: product_url, analysis, leads: scoredLeads }),
+      signal: AbortSignal.timeout(60000),
+    })
+    const shareData = await shareRes.json()
+
+    if (!shareRes.ok || !shareData.token) {
+      await mark({ status: 'error', error_message: shareData.error || 'save-share did not return a token' })
+      return
+    }
+
+    const qualified = scoredLeads.filter((l: any) => l.tier !== 'close')
+    const leadCount = qualified.length || scoredLeads.length
+    const topScore = Math.max(0, ...scoredLeads.map((l: any) => l.score || 0))
+
+    await mark({ status: 'done', share_token: shareData.token, lead_count: leadCount, top_score: topScore, error_message: null })
+    console.log(`[watchlist-scan] item ${id}: done — token ${shareData.token}, ${leadCount} qualified leads`)
+  } catch (e: any) {
+    console.log(`[watchlist-scan] item ${id} error:`, e.message)
+    await mark({ status: 'error', error_message: e.message || 'Unknown error' })
+  }
+}
+
 // ─── Main handler ──────────────────────────────────────────────────────
 Deno.serve(async (req) => {
   // Daily maintenance — holds 7+ day inactive accounts (#5) and sweeps
@@ -455,6 +668,13 @@ Deno.serve(async (req) => {
   const requestUrl = new URL(req.url)
   if (requestUrl.searchParams.get('task') === 'daily-maintenance') {
     return runDailyMaintenance()
+  }
+
+  // Admin X-lead watchlist batch (#4) — routed here by ?task=watchlist-scan,
+  // same one-function-covers-everything approach as daily-maintenance
+  // above. Returns before any of the normal scan logic below runs.
+  if (requestUrl.searchParams.get('task') === 'watchlist-scan') {
+    return runWatchlistScan()
   }
 
   console.log('[cron-scan] starting run at', new Date().toISOString())
