@@ -489,6 +489,15 @@ async function runWatchlistScan(): Promise<Response> {
   // so it lands even on an invocation that immediately bails out.
   await supabase.from('watchlist_control').update({ last_activity_at: startedAt }).eq('id', 'global')
 
+  // Retire this invocation's own trigger job immediately, before anything
+  // else decides whether a new one is needed. This is what makes a
+  // missing kairo-watchlist-followup job an honest signal ("nothing
+  // pending right now") instead of what used to happen: a job that
+  // silently missed its one shot sitting there reporting active: true for
+  // up to a year with nothing actually scheduled to happen. No-op (caught
+  // server-side) if nothing is currently scheduled under this name.
+  await supabase.rpc('unschedule_watchlist_followup').catch(() => {})
+
   try {
     const { data: control } = await supabase
       .from('watchlist_control')
@@ -687,6 +696,15 @@ Deno.serve(async (req) => {
   }
 
   console.log('[cron-scan] starting run at', new Date().toISOString())
+
+  // Same fix as the watchlist batch's own self-reschedule (see
+  // runWatchlistScan above): retire kairo-batch-followup immediately at
+  // the start of every run, before deciding below whether a new one is
+  // needed. This job turned out to have the identical staleness flaw —
+  // confirmed dead since Oct 21, silently reporting active: true the
+  // whole time with nothing actually going to fire. No-op if nothing is
+  // currently scheduled under this name.
+  await supabase.rpc('unschedule_batch_followup').catch(() => {})
 
   try {
     const { data: profiles, error: profilesErr } = await supabase
