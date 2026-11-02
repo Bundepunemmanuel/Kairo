@@ -88,7 +88,19 @@ async function fetchSubreddit(subreddit: string, source: 'direct' | 'worker' | '
       return []
     }
     const xml = await res.text()
-    if (!xml.includes('<entry>')) return []
+    if (!xml.includes('<entry>')) {
+      // reddit.js returns 200 even for its own "all sources exhausted"
+      // empty-feed fallback, so the !res.ok check above never catches
+      // this case — without this line, Supabase's logs showed nothing at
+      // all here, and the real reason (status/body from Reddit or the
+      // worker) only ever existed in Vercel's logs for reddit.js. This
+      // doesn't replace checking Vercel for the root cause, but it means
+      // Supabase's own logs now at least show WHERE in the pipeline it
+      // went quiet, without needing to cross-reference two dashboards
+      // just to notice something failed.
+      console.log(`[cron-scan] [${source}] r/${subreddit} — proxy returned 200 but no posts (check Vercel reddit.js logs around this timestamp for the real cause: Reddit block/captcha vs worker error vs genuinely empty)`)
+      return []
+    }
     return parseAtom(xml, subreddit)
   } catch (e) {
     console.log(`[cron-scan] [${source}] reddit proxy error for r/${subreddit}:`, e.message)
@@ -616,6 +628,7 @@ async function processWatchlistItem(item: { id: string; product_url: string; x_p
     // the dedicated watchlist worker instead of the live-traffic one.
     const directSubs = subreddits.slice(0, 3)
     const watchlistWorkerSubs = subreddits.slice(3, 6)
+    console.log(`[watchlist-scan] item ${id}: subreddits — direct=[${directSubs.join(',')}] watchlist-worker=[${watchlistWorkerSubs.join(',')}]`)
 
     await Promise.all([
       directSubs.length ? waitForRedditQuota('direct') : Promise.resolve(),
@@ -632,6 +645,7 @@ async function processWatchlistItem(item: { id: string; product_url: string; x_p
     const freshPosts = combinedPosts.filter((p: any) => p.body && p.body.length > 40)
 
     if (!freshPosts.length) {
+      console.log(`[watchlist-scan] item ${id}: 0 posts after fetch — both direct and watchlist-worker came back empty (see reddit.js logs in Vercel for the real cause on each subreddit)`)
       await mark({ status: 'error', error_message: 'No Reddit posts found across this product\u2019s matched subreddits' })
       return
     }
@@ -640,6 +654,8 @@ async function processWatchlistItem(item: { id: string; product_url: string; x_p
     // includeCloseMatches so save-share gets the same full leads array
     // onboarding.js's own Save & Share button would produce.
     const { leads: scoredLeads } = await scorePosts(freshPosts, analysis, true)
+    const qualifiedCount = scoredLeads.filter((l: any) => l.tier !== 'close').length
+    console.log(`[watchlist-scan] item ${id}: scored ${freshPosts.length} posts → ${scoredLeads.length} leads (${qualifiedCount} qualified, ${scoredLeads.length - qualifiedCount} close)`)
 
     if (!scoredLeads.length) {
       await mark({ status: 'error', error_message: 'No matching leads found for this product right now' })
@@ -658,6 +674,7 @@ async function processWatchlistItem(item: { id: string; product_url: string; x_p
     const shareData = await shareRes.json()
 
     if (!shareRes.ok || !shareData.token) {
+      console.log(`[watchlist-scan] item ${id}: save-share failed — status ${shareRes.status}, error: ${shareData.error || '(no error field returned)'}`)
       await mark({ status: 'error', error_message: shareData.error || 'save-share did not return a token' })
       return
     }
@@ -669,7 +686,7 @@ async function processWatchlistItem(item: { id: string; product_url: string; x_p
     await mark({ status: 'done', share_token: shareData.token, lead_count: leadCount, top_score: topScore, error_message: null })
     console.log(`[watchlist-scan] item ${id}: done — token ${shareData.token}, ${leadCount} qualified leads`)
   } catch (e: any) {
-    console.log(`[watchlist-scan] item ${id} error:`, e.message)
+    console.log(`[watchlist-scan] item ${id} unexpected error:`, e.message, '\n', e.stack || '(no stack trace available)')
     await mark({ status: 'error', error_message: e.message || 'Unknown error' })
   }
 }
