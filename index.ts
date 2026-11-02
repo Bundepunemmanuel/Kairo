@@ -496,7 +496,7 @@ async function runWatchlistScan(): Promise<Response> {
   // silently missed its one shot sitting there reporting active: true for
   // up to a year with nothing actually scheduled to happen. No-op (caught
   // server-side) if nothing is currently scheduled under this name.
-  await supabase.rpc('unschedule_watchlist_followup').catch(() => {})
+  try { await supabase.rpc('unschedule_watchlist_followup') } catch {}
 
   try {
     const { data: control } = await supabase
@@ -704,7 +704,7 @@ Deno.serve(async (req) => {
   // confirmed dead since Oct 21, silently reporting active: true the
   // whole time with nothing actually going to fire. No-op if nothing is
   // currently scheduled under this name.
-  await supabase.rpc('unschedule_batch_followup').catch(() => {})
+  try { await supabase.rpc('unschedule_batch_followup') } catch {}
 
   try {
     const { data: profiles, error: profilesErr } = await supabase
