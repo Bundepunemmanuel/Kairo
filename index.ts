@@ -91,14 +91,17 @@ async function fetchSubreddit(subreddit: string, source: 'direct' | 'worker' | '
     if (!xml.includes('<entry>')) {
       // reddit.js returns 200 even for its own "all sources exhausted"
       // empty-feed fallback, so the !res.ok check above never catches
-      // this case — without this line, Supabase's logs showed nothing at
-      // all here, and the real reason (status/body from Reddit or the
-      // worker) only ever existed in Vercel's logs for reddit.js. This
-      // doesn't replace checking Vercel for the root cause, but it means
-      // Supabase's own logs now at least show WHERE in the pipeline it
-      // went quiet, without needing to cross-reference two dashboards
-      // just to notice something failed.
-      console.log(`[cron-scan] [${source}] r/${subreddit} — proxy returned 200 but no posts (check Vercel reddit.js logs around this timestamp for the real cause: Reddit block/captcha vs worker error vs genuinely empty)`)
+      // this case. reddit.js now carries the actual reason back via the
+      // X-Kairo-Last-Error header (status/body snippet, or the exception
+      // message) instead of only logging it locally — Vercel's log
+      // retention can be as short as 1 hour depending on plan, which
+      // made that detail routinely unrecoverable by the time anyone
+      // actually went looking. Logging the decoded header here means the
+      // real cause lands in the same place as everything else this run
+      // already logs, not a second dashboard with its own expiry clock.
+      const lastErrorHeader = res.headers.get('x-kairo-last-error')
+      const reason = lastErrorHeader ? decodeURIComponent(lastErrorHeader) : '(no detail header present — reddit.js may predate this)'
+      console.log(`[cron-scan] [${source}] r/${subreddit} — proxy returned 200 but no posts. Reason: ${reason}`)
       return []
     }
     return parseAtom(xml, subreddit)
