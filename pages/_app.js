@@ -1,23 +1,18 @@
 import { useState, useEffect, createContext, useContext } from 'react'
 import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
-import posthog from 'posthog-js'
+import { track, markOwnerDeviceIfRequested } from '../lib/analytics'
 import '../styles/globals.css'
 
 // Auth context — available to all pages
 export const AuthContext = createContext({ user: null, loading: true })
 export const useAuth = () => useContext(AuthContext)
 
-// Analytics — kept here rather than a new lib/ file. Requires
-// NEXT_PUBLIC_POSTHOG_KEY to be set in Vercel; silently does nothing
-// without it (dev/preview environments, or before the key is added),
-// rather than throwing.
-let posthogReady = false
-
-export function track(event, properties = {}) {
-  if (typeof window === 'undefined' || !posthogReady) return
-  posthog.capture(event, properties)
-}
+// Self-hosted analytics (replaces PostHog) — the actual implementation
+// lives in lib/analytics.js; re-exported here so every existing call site
+// across the app (`import { track } from './_app'` / `'../_app'`) keeps
+// working unchanged.
+export { track }
 
 export default function App({ Component, pageProps }) {
   const [user, setUser] = useState(null)
@@ -25,20 +20,22 @@ export default function App({ Component, pageProps }) {
   const router = useRouter()
 
   useEffect(() => {
-    if (typeof window !== 'undefined' && process.env.NEXT_PUBLIC_POSTHOG_KEY && !posthogReady) {
-      posthog.init(process.env.NEXT_PUBLIC_POSTHOG_KEY, {
-        api_host: process.env.NEXT_PUBLIC_POSTHOG_HOST || 'https://us.i.posthog.com',
-        capture_pageview: true,
-      })
-      posthogReady = true
+    // Mirrors what PostHog's capture_pageview did: a page_view on initial
+    // load, then one more on every client-side route change (Next's Pages
+    // Router doesn't full-reload, so route changes need this fired
+    // manually or every page after the first is invisible to the funnel).
+    // markOwnerDeviceIfRequested runs on the same two triggers so
+    // ?kairo_owner=1 is caught whichever page it lands on, not just the
+    // homepage.
+    markOwnerDeviceIfRequested()
+    track('page_view')
 
-      // capture_pageview only fires on the initial load — Next's Pages
-      // Router doesn't full-reload on navigation, so route changes need
-      // to be captured manually or every page after the first is invisible.
-      const handleRouteChange = () => posthog.capture('$pageview')
-      router.events.on('routeChangeComplete', handleRouteChange)
-      return () => router.events.off('routeChangeComplete', handleRouteChange)
+    const handleRouteChange = () => {
+      markOwnerDeviceIfRequested()
+      track('page_view')
     }
+    router.events.on('routeChangeComplete', handleRouteChange)
+    return () => router.events.off('routeChangeComplete', handleRouteChange)
   }, [router.events])
 
   useEffect(() => {

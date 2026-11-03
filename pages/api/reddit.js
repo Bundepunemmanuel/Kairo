@@ -26,16 +26,26 @@ const supabaseAdmin = createClient(
 // and forgotten.
 const WORKER_BASE_URL = 'https://kairo-reddit-proxy.bundepunemmanuel.workers.dev/'
 
+// A second, dedicated Cloudflare Worker — its own IP, its own independent
+// quota bucket, used ONLY by the admin watchlist batch (index.ts,
+// ?task=watchlist-scan). Deliberately separate from WORKER_BASE_URL so the
+// watchlist batch never competes with real visitors for the live-traffic
+// worker's quota — the batch only ever shares the 'direct' bucket with
+// live traffic (same single Vercel egress IP, unavoidable), never 'worker'.
+const WATCHLIST_WORKER_BASE_URL = 'https://watchlist-worker.bundepunemmanuel.workers.dev/'
+
 // Logs whatever rate-limit-related headers Reddit sends — on every
 // response, not just 429s. Logging it on success too lets us watch
 // X-Ratelimit-Remaining actually decrease request to request, instead of
 // only ever seeing the quota at the moment it hits zero.
 //
 // rowId distinguishes which quota bucket this response belongs to —
-// 'direct' (this app's own egress) or 'worker' (the Cloudflare Worker's
-// separate IP). Logged explicitly alongside the usual headers so a run
-// touching both paths never has an ambiguous log line about which bucket
-// a given 429 or success actually came from.
+// 'direct' (this app's own egress), 'worker' (the live-traffic Cloudflare
+// Worker's separate IP), or 'watchlist-worker' (the admin batch's own
+// dedicated Worker, a third independent IP/bucket). Logged explicitly
+// alongside the usual headers so a run touching multiple paths never has
+// an ambiguous log line about which bucket a given 429 or success
+// actually came from.
 //
 // AWAITED, not fire-and-forget. It used to be fire-and-forget on the
 // reasoning that persistence shouldn't slow down the real Reddit
@@ -72,12 +82,12 @@ async function logRateLimitHeaders(tag, response, rowId = 'direct') {
 async function persistRateLimit(response, rowId = 'direct') {
   const resetSeconds = response.headers.get('x-ratelimit-reset')
   if (resetSeconds == null) {
-    // The worker may not relay Reddit's rate-limit headers through
+    // A worker may not relay Reddit's rate-limit headers through
     // unmodified — unconfirmed either way yet. If this fires consistently
-    // for rowId === 'worker' while 'direct' keeps reporting real values,
-    // that's the signal the worker path needs its own header pass-through
+    // for a given worker rowId while 'direct' keeps reporting real values,
+    // that's the signal that worker path needs its own header pass-through
     // fix before its quota tracking can be trusted the same way direct's is.
-    if (rowId === 'worker') console.log('[reddit:rate-limit:worker] no X-Ratelimit-Reset header on this response — worker may not be relaying it')
+    if (rowId !== 'direct') console.log(`[reddit:rate-limit:${rowId}] no X-Ratelimit-Reset header on this response — worker may not be relaying it`)
     return // nothing Reddit told us this time — leave the existing row alone
   }
 
@@ -118,27 +128,30 @@ export default async function handler(req, res) {
 
   // Default mode: fetch subreddit feed. source='direct' (default) hits
   // Reddit straight from this app's own egress; source='worker' routes
-  // the same request through the Cloudflare Worker proxy instead — two
-  // separate IPs, two separate quota buckets (see WORKER_BASE_URL above).
+  // through the live-traffic Cloudflare Worker proxy; source=
+  // 'watchlist-worker' routes through the admin batch's own dedicated
+  // Worker instead — three separate IPs, three separate quota buckets
+  // (see WORKER_BASE_URL / WATCHLIST_WORKER_BASE_URL above).
   if (!sub) return res.status(400).json({ error: 'sub required' })
   return fetchSubredditFeed(req, res, sub, sort, source)
 }
 
 async function fetchRateLimitStatus(req, res) {
   try {
-    // Both rows in one query — callers that use both paths (onboarding.js,
-    // share/[token].js, index.ts) need to know whichever one is the
-    // binding constraint, not just one of them.
+    // All three rows in one query — callers that use multiple paths
+    // (onboarding.js, share/[token].js, index.ts, the admin watchlist
+    // panel) need to know whichever one is the binding constraint, not
+    // just one of them.
     const { data, error } = await supabaseAdmin
       .from('reddit_rate_limit')
       .select('id, reset_at, remaining, updated_at')
-      .in('id', ['direct', 'worker'])
+      .in('id', ['direct', 'worker', 'watchlist-worker'])
 
+    const empty = { resetAt: null, remaining: null }
     if (error) {
       console.log('[reddit:status] read error:', error.message)
       return res.status(200).json({
-        direct: { resetAt: null, remaining: null },
-        worker: { resetAt: null, remaining: null },
+        direct: empty, worker: empty, 'watchlist-worker': empty,
         serverNow: new Date().toISOString(),
       })
     }
@@ -150,13 +163,14 @@ async function fetchRateLimitStatus(req, res) {
     return res.status(200).json({
       direct: { resetAt: byId.direct?.reset_at || null, remaining: byId.direct?.remaining ?? null },
       worker: { resetAt: byId.worker?.reset_at || null, remaining: byId.worker?.remaining ?? null },
+      'watchlist-worker': { resetAt: byId['watchlist-worker']?.reset_at || null, remaining: byId['watchlist-worker']?.remaining ?? null },
       serverNow: new Date().toISOString(),
     })
   } catch (e) {
     console.log('[reddit:status] fatal:', e.message)
+    const empty = { resetAt: null, remaining: null }
     return res.status(200).json({
-      direct: { resetAt: null, remaining: null },
-      worker: { resetAt: null, remaining: null },
+      direct: empty, worker: empty, 'watchlist-worker': empty,
       serverNow: new Date().toISOString(),
     })
   }
@@ -164,7 +178,16 @@ async function fetchRateLimitStatus(req, res) {
 
 async function fetchSubredditFeed(req, res, sub, sort, source = 'direct') {
   const sorts = sort === 'new' ? ['new', 'hot'] : [sort, 'new']
-  const rowId = source === 'worker' ? 'worker' : 'direct'
+  const rowId = source === 'worker' ? 'worker' : source === 'watchlist-worker' ? 'watchlist-worker' : 'direct'
+
+  // Carried back to the caller via the X-Kairo-Last-Error response header
+  // on the final empty-feed fallback below — not just logged locally.
+  // Vercel's own log retention can be as short as 1 hour depending on
+  // plan, while index.ts's caller (Supabase) logs this same detail
+  // alongside everything else it already tracks for the run, which has
+  // held onto entries for much longer in practice. Same information,
+  // written to wherever it'll actually still be readable later.
+  let lastFailureDetail = null
 
   for (const s of sorts) {
     try {
@@ -186,16 +209,17 @@ async function fetchSubredditFeed(req, res, sub, sort, source = 'direct') {
       // 100 posts actually arrive from a single request today.
       const targetUrl = `https://www.reddit.com/r/${encodeURIComponent(sub)}/${s}.rss?limit=250`
 
-      // source='worker' routes through the Cloudflare Worker proxy
+      // source='worker' (live traffic) or source='watchlist-worker' (admin
+      // batch only) each route through their own Cloudflare Worker proxy
       // instead of fetching Reddit directly — same target URL, wrapped as
-      // the worker's own ?url= param. A genuinely separate IP/quota bucket
-      // (confirmed independently), which is the whole reason this exists:
-      // two groups of subreddits fetched concurrently through two
-      // different IPs instead of all of them sharing one ~1-request-per-
-      // window budget. See index.ts for where the subreddit list actually
-      // gets split.
-      const fetchUrl = rowId === 'worker'
-        ? `${WORKER_BASE_URL}?url=${encodeURIComponent(targetUrl)}`
+      // that worker's own ?url= param. Each is a genuinely separate
+      // IP/quota bucket, which is the whole reason this exists: subreddits
+      // fetched concurrently through different IPs instead of all of them
+      // sharing one ~1-request-per-window budget. See index.ts for where
+      // the subreddit list actually gets split for each caller.
+      const workerBaseForRowId = rowId === 'worker' ? WORKER_BASE_URL : rowId === 'watchlist-worker' ? WATCHLIST_WORKER_BASE_URL : null
+      const fetchUrl = workerBaseForRowId
+        ? `${workerBaseForRowId}?url=${encodeURIComponent(targetUrl)}`
         : targetUrl
 
       const response = await fetch(fetchUrl, {
@@ -218,12 +242,24 @@ async function fetchSubredditFeed(req, res, sub, sort, source = 'direct') {
       // before.)
       if (response.status === 429) {
         console.log(`[reddit:${s}] [${rowId}] r/${sub} — 429 (quota exhausted), skipping fallback tier`)
+        lastFailureDetail = `status=429 (quota exhausted on ${s} tier)`
         break
       }
 
       const text = await response.text()
       if (!text.includes('<entry>')) {
-        console.log(`[reddit:${s}] [${rowId}] r/${sub} empty result (status ${response.status})`)
+        // A 200 with no <entry> could mean several very different things —
+        // a genuinely empty/quiet subreddit, Reddit serving a captcha or
+        // block page instead of the RSS feed, or (for a worker-routed
+        // request) the Cloudflare Worker itself returning its own error
+        // body rather than relaying Reddit's response. Those all looked
+        // identical in the logs before this — status code alone doesn't
+        // distinguish them. The snippet does: real Atom starts with
+        // '<?xml' / '<feed', an HTML block page starts with '<html' or
+        // '<!DOCTYPE', a worker error is usually JSON ('{').
+        const snippet = text.slice(0, 200).replace(/\s+/g, ' ').trim()
+        console.log(`[reddit:${s}] [${rowId}] r/${sub} empty result (status ${response.status}) — body starts: ${snippet || '(empty body)'}`)
+        lastFailureDetail = `status=${response.status} (${s} tier) body="${snippet || '(empty body)'}"`
         continue
       }
 
@@ -233,12 +269,23 @@ async function fetchSubredditFeed(req, res, sub, sort, source = 'direct') {
       res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate')
       return res.status(200).send(text)
     } catch (e) {
-      console.log(`[reddit:${s}] [${rowId}] r/${sub} fetch error: ${e.message}`)
+      // Distinct prefix for a worker-routed exception specifically — this
+      // means the Worker itself is unreachable/timing out (DNS, cold
+      // start, the Worker erroring before it even relays anything), a
+      // different failure mode than Reddit blocking or rate-limiting the
+      // request, and worth being able to grep for on its own.
+      const label = rowId !== 'direct' ? `WORKER-UNREACHABLE [${rowId}]` : `[${rowId}]`
+      console.log(`[reddit:${s}] ${label} r/${sub} fetch error: ${e.message}`)
+      lastFailureDetail = `exception (${s} tier): ${e.message}`
       continue
     }
   }
 
   console.log(`[reddit] [${rowId}] r/${sub} — all sources exhausted, returning empty feed`)
+  // Header value must be ASCII and newline-free — encodeURIComponent
+  // handles both, and the caller (index.ts) decodes it back before
+  // logging.
+  res.setHeader('X-Kairo-Last-Error', encodeURIComponent((lastFailureDetail || 'no failure recorded — unexpected').slice(0, 300)))
   return res.status(200).send('<feed></feed>')
 }
 

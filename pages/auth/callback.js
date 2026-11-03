@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useRouter } from 'next/router'
 import { supabase } from '../../lib/supabase'
+import { track } from '../_app'
 
 export default function AuthCallback() {
   const router = useRouter()
@@ -15,6 +16,17 @@ export default function AuthCallback() {
         // Something went wrong — send back to login
         router.replace('/login')
         return
+      }
+
+      // This page is also where a returning user's magic-link login lands,
+      // not just a fresh signup's email confirmation — so signup_completed
+      // only fires when the account itself was created very recently.
+      // created_at vs now, rather than "no product profile yet" (a
+      // returning user who never finished onboarding would also have no
+      // profile, and would wrongly count as a new signup otherwise).
+      const accountAgeMs = Date.now() - new Date(session.user.created_at).getTime()
+      if (accountAgeMs < 15 * 60 * 1000) {
+        track('signup_completed', { method: 'email_confirmation' })
       }
 
       // Check if user has a saved product profile

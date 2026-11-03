@@ -1,10 +1,19 @@
-// log-scan.js — Logs one row to scan_feed for the homepage ticker.
-// Called from every scan path (onboarding.js's main flow, share/[token].js's
-// notify-me flow) right after scoring completes — deliberately not tied to
-// signup, email capture, or Save & Share, so the ticker reflects every scan
-// that found something, not just ones that led to an account. Fire-and-
-// forget from the caller; never blocks showing results to the person
-// who just scanned.
+// log-scan.js — Logs one row to scan_feed for the homepage ticker, OR one
+// row to visitor_events for the self-hosted analytics system (replaces
+// PostHog — see lib/analytics.js). The two are kept in one file as two
+// separate branches, keyed on whether eventType is present in the body,
+// rather than as two separate routes, since both are the same shape of
+// thing: a public, unauthenticated, fire-and-forget logging endpoint.
+//
+// scan_feed branch: called from every scan path (onboarding.js's main
+// flow, share/[token].js's notify-me flow) right after scoring completes
+// — deliberately not tied to signup, email capture, or Save & Share, so
+// the ticker reflects every scan that found something, not just ones
+// that led to an account. Fire-and-forget from the caller; never blocks
+// showing results to the person who just scanned.
+//
+// visitor_events branch: called from lib/analytics.js's track() on every
+// tracked event across the app, same fire-and-forget philosophy.
 
 import { createClient } from '@supabase/supabase-js'
 
@@ -16,6 +25,33 @@ const supabaseAdmin = createClient(
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
+  // ─── Analytics event branch ──────────────────────────────────────────
+  if (req.body && req.body.eventType) {
+    const { eventType, visitorId, deviceType, isOwner, path, properties } = req.body
+    if (!eventType || !visitorId) {
+      return res.status(400).json({ error: 'eventType and visitorId are required' })
+    }
+    try {
+      const { error } = await supabaseAdmin.from('visitor_events').insert({
+        event_type: String(eventType).slice(0, 120),
+        visitor_id: String(visitorId).slice(0, 200),
+        device_type: deviceType ? String(deviceType).slice(0, 20) : null,
+        is_owner: !!isOwner,
+        path: path ? String(path).slice(0, 300) : null,
+        properties: properties && typeof properties === 'object' ? properties : {},
+      })
+      if (error) {
+        console.log('[log-scan:event] insert error:', error.message)
+        return res.status(500).json({ error: 'Could not log event' })
+      }
+      return res.status(200).json({ ok: true })
+    } catch (err) {
+      console.error('[log-scan:event] fatal:', err.message)
+      return res.status(500).json({ error: 'Something went wrong' })
+    }
+  }
+
+  // ─── scan_feed branch (unchanged) ────────────────────────────────────
   const { productName, leadCount, topScore, url } = req.body
   if (!productName || !leadCount || leadCount < 1) {
     // Zero-qualified scans never reach here by design — the caller only

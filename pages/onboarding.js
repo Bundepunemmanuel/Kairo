@@ -449,7 +449,7 @@ export default function Onboarding() {
         qualifiedCount: qualifiedForFeed.length,
         closeMatchCount: closeForFeed.length,
       })
-      if (qualifiedForFeed.length === 0) track('zero_results_shown')
+      if (qualifiedForFeed.length === 0) track('zero_results_shown', { url: clean })
 
       // Public homepage ticker — every scan that found something, not just
       // ones tied to an account. Fire-and-forget: never blocks or delays
@@ -470,6 +470,20 @@ export default function Onboarding() {
       // Save product profile and leads to database if user is logged in
       if (user) {
         try {
+          // Checked BEFORE the upsert below, specifically so
+          // monitoring_activated only fires the first time this user ever
+          // gets a product_profiles row — product_profiles is what
+          // index.ts's cron loop reads to decide who gets scanned daily,
+          // so creating this row IS what turns monitoring on. The upsert
+          // itself (onConflict: 'user_id') also runs on every later
+          // rescan, which must not re-fire this event.
+          const { data: existingProfile } = await supabase
+            .from('product_profiles')
+            .select('user_id')
+            .eq('user_id', user.id)
+            .maybeSingle()
+          const isFirstActivation = !existingProfile
+
           // Save product profile
           await supabase.from('product_profiles').upsert({
             user_id: user.id,
@@ -477,6 +491,8 @@ export default function Onboarding() {
             analysis: productAnalysis,
             updated_at: new Date().toISOString(),
           }, { onConflict: 'user_id' })
+
+          if (isFirstActivation) track('monitoring_activated')
 
           // Save leads — qualified tier only. Close matches are shown in
           // the onboarding UI for context but were explicitly scoped to

@@ -8,6 +8,41 @@ import { useAuth } from './_app'
 const PLAN_LABELS = { free: 'Free', starter: 'Starter', pro: 'Pro', unlimited: 'Unlimited' }
 const ADMIN_EMAIL = 'bundepunemmanuel@gmail.com'
 
+// Wraps a section in an expand/collapse header, open/closed state
+// persisted per section so it's remembered across reloads. Nothing it
+// wraps changes — every section still has its full functionality, this
+// only controls whether it's taking up scroll space by default. Meant
+// for the lower-frequency sections (churn/subreddits, upgrade requests,
+// the full user table, analytics); the cron banner, stat tiles, and
+// watchlist panel stay always-visible since those are what actually get
+// checked often.
+function CollapsibleSection({ title, storageKey, defaultOpen = false, children }) {
+  const [open, setOpen] = useState(defaultOpen)
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(`kairo_admin_section_${storageKey}`)
+      if (saved !== null) setOpen(saved === '1')
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  const toggle = () => {
+    setOpen(prev => {
+      const next = !prev
+      try { localStorage.setItem(`kairo_admin_section_${storageKey}`, next ? '1' : '0') } catch {}
+      return next
+    })
+  }
+  return (
+    <div className="admin-collapsible" style={{ marginBottom: 20 }}>
+      <button className="admin-collapsible-header" onClick={toggle}>
+        <span>{title}</span>
+        <span className="admin-collapsible-chevron">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && <div className="admin-collapsible-body">{children}</div>}
+    </div>
+  )
+}
+
 export default function Admin() {
   const { user, loading: authLoading } = useAuth()
   const router = useRouter()
@@ -29,6 +64,16 @@ export default function Admin() {
   const [userLeadsById, setUserLeadsById] = useState({}) // { [user_id]: leads[] }
   const [loadingLeadsFor, setLoadingLeadsFor] = useState(null)
 
+  // Admin X-lead watchlist (#4)
+  const [watchlistData, setWatchlistData] = useState(null) // { items, isRunning, cancelRequested, pendingCount }
+  const [watchlistPasteText, setWatchlistPasteText] = useState('')
+  const [watchlistAdding, setWatchlistAdding] = useState(false)
+  const [watchlistAddResult, setWatchlistAddResult] = useState(null) // { inserted, skipped }
+  const [watchlistBusy, setWatchlistBusy] = useState(false) // run/stop in flight
+
+  // Analytics state and the owner-device toggle now live on their own
+  // page — see pages/admin-analytics.js.
+
   useEffect(() => {
     if (!authLoading && !user) { router.replace('/login'); return }
     if (!authLoading && user && user.email !== ADMIN_EMAIL) { router.replace('/dashboard'); return }
@@ -37,7 +82,18 @@ export default function Admin() {
   useEffect(() => {
     if (!user || user.email !== ADMIN_EMAIL) return
     loadAdminData()
+    loadWatchlist()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user])
+
+  // Poll while a batch is actively running so status/progress/new share
+  // links show up without the admin needing to refresh the page.
+  useEffect(() => {
+    if (!watchlistData?.isRunning) return
+    const interval = setInterval(loadWatchlist, 5000)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [watchlistData?.isRunning])
 
   const loadAdminData = async () => {
     setLoading(true)
@@ -219,6 +275,121 @@ export default function Admin() {
     }
   }
 
+  // ─── Admin X-lead watchlist (#4) ─────────────────────────────────────
+  const loadWatchlist = async () => {
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'watchlist-list', requesterEmail: user.email }),
+      })
+      const data = await res.json()
+      if (data.error) { console.log('[admin] watchlist load error:', data.error); return }
+      setWatchlistData(data)
+    } catch (e) {
+      console.log('[admin] watchlist load error:', e.message)
+    }
+  }
+
+  const handleWatchlistAdd = async () => {
+    if (!watchlistPasteText.trim()) return
+    setWatchlistAdding(true)
+    setWatchlistAddResult(null)
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'watchlist-add', requesterEmail: user.email, pairs: watchlistPasteText }),
+      })
+      const data = await res.json()
+      if (data.error) { alert(data.error); return }
+      setWatchlistAddResult(data)
+      if (data.inserted > 0) setWatchlistPasteText('')
+      await loadWatchlist()
+    } catch (e) {
+      alert('Add failed: ' + e.message)
+    } finally {
+      setWatchlistAdding(false)
+    }
+  }
+
+  const handleWatchlistRun = async () => {
+    setWatchlistBusy(true)
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'watchlist-run', requesterEmail: user.email }),
+      })
+      const data = await res.json()
+      if (data.error) { alert(data.error); return }
+      await loadWatchlist()
+    } catch (e) {
+      alert('Run failed: ' + e.message)
+    } finally {
+      setWatchlistBusy(false)
+    }
+  }
+
+  const handleWatchlistStop = async () => {
+    setWatchlistBusy(true)
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'watchlist-stop', requesterEmail: user.email }),
+      })
+      const data = await res.json()
+      if (data.error) { alert(data.error); return }
+      await loadWatchlist()
+    } catch (e) {
+      alert('Stop failed: ' + e.message)
+    } finally {
+      setWatchlistBusy(false)
+    }
+  }
+
+  // Recovery path for a chain that died silently (is_running stuck true
+  // with no heartbeat) — clears control state AND requeues any item left
+  // stranded on 'scanning'.
+  const handleWatchlistForceReset = async () => {
+    if (!confirm('Reset the watchlist batch state? Any item stuck mid-scan will be requeued as pending.')) return
+    setWatchlistBusy(true)
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'watchlist-force-reset', requesterEmail: user.email }),
+      })
+      const data = await res.json()
+      if (data.error) { alert(data.error); return }
+      await loadWatchlist()
+    } catch (e) {
+      alert('Reset failed: ' + e.message)
+    } finally {
+      setWatchlistBusy(false)
+    }
+  }
+
+  const handleWatchlistDelete = async (id, productUrl) => {
+    if (!confirm(`Remove ${productUrl} from the watchlist?`)) return
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'watchlist-delete', requesterEmail: user.email, id }),
+      })
+      const data = await res.json()
+      if (data.error) { alert(data.error); return }
+      await loadWatchlist()
+    } catch (e) {
+      alert('Delete failed: ' + e.message)
+    }
+  }
+
+  // Analytics loading/handlers now live on their own page — see
+  // pages/admin-analytics.js.
+
   const formatDate = ts => ts ? new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—'
   const formatRelative = ts => {
     if (!ts) return 'never'
@@ -305,61 +476,68 @@ export default function Admin() {
           </div>
 
           {/* Churn risk + top subreddits as cards */}
-          <div className="admin-cards-row">
-            <div className="admin-card">
-              <h3 className="admin-card-title">⚠️ Churn risk ({adminData.churnRisk.length})</h3>
-              <p className="admin-card-sub">No activity in 7+ days · sorted by real risk, not just silence</p>
-              {adminData.churnRisk.length === 0 ? (
-                <p className="admin-card-empty">No users at risk right now.</p>
-              ) : (
-                <div className="admin-churn-list">
-                  {adminData.churnRisk.slice(0, 5).map(u => (
-                    <div key={u.user_id} className="admin-churn-row">
-                      <div className="admin-churn-row-top">
-                        <span className="admin-churn-name">{u.name}</span>
-                        <span className={`admin-plan-badge admin-plan-${u.plan}`}>{u.plan}</span>
+          <CollapsibleSection title={`⚠️ Churn risk & top subreddits (${adminData.churnRisk.length} at risk)`} storageKey="churn" defaultOpen={false}>
+            <div className="admin-cards-row">
+              <div className="admin-card">
+                <h3 className="admin-card-title">⚠️ Churn risk ({adminData.churnRisk.length})</h3>
+                <p className="admin-card-sub">No activity in 7+ days · sorted by real risk, not just silence</p>
+                {adminData.churnRisk.length === 0 ? (
+                  <p className="admin-card-empty">No users at risk right now.</p>
+                ) : (
+                  <div className="admin-churn-list">
+                    {adminData.churnRisk.slice(0, 5).map(u => (
+                      <div key={u.user_id} className="admin-churn-row">
+                        <div className="admin-churn-row-top">
+                          <span className="admin-churn-name">{u.name}</span>
+                          <span className={`admin-plan-badge admin-plan-${u.plan}`}>{u.plan}</span>
+                        </div>
+                        <div className="admin-churn-row-sub">
+                          {u.daysInactive}d inactive · {u.pushEnabled ? '🔔 push on' : '🔕 push off'}
+                        </div>
                       </div>
-                      <div className="admin-churn-row-sub">
-                        {u.daysInactive}d inactive · {u.pushEnabled ? '🔔 push on' : '🔕 push off'}
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="admin-card">
+                <h3 className="admin-card-title">📊 Top subreddits</h3>
+                <p className="admin-card-sub">Across all users</p>
+                <div className="admin-subreddit-chips">
+                  {adminData.topSubreddits.map(([sub, count]) => (
+                    <span key={sub} className="dash-admin-subreddit-chip">r/{sub} ({count})</span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </CollapsibleSection>
+
+          {/* Upgrade requests — recorded interest, not real billing yet */}
+          <CollapsibleSection title={`💳 Upgrade requests (${(adminData.upgradeRequests || []).length})`} storageKey="upgrade-requests" defaultOpen={(adminData.upgradeRequests || []).length > 0}>
+            <div className="admin-card" style={{ marginBottom: 0 }}>
+              <p className="admin-card-sub">Users who tapped "Get [plan]" on the Billing page before checkout was live</p>
+              {(adminData.upgradeRequests || []).length === 0 ? (
+                <p className="admin-card-empty">No upgrade requests yet.</p>
+              ) : (
+                <div className="admin-user-table">
+                  {adminData.upgradeRequests.map((r, i) => (
+                    <div key={i} className="admin-user-row">
+                      <div className="admin-user-info">
+                        <span className="admin-user-name">{r.email || r.user_id}</span>
+                        <span className="admin-user-meta">wants {r.requested_plan} · {formatRelative(r.created_at)}</span>
                       </div>
                     </div>
                   ))}
                 </div>
               )}
             </div>
-            <div className="admin-card">
-              <h3 className="admin-card-title">📊 Top subreddits</h3>
-              <p className="admin-card-sub">Across all users</p>
-              <div className="admin-subreddit-chips">
-                {adminData.topSubreddits.map(([sub, count]) => (
-                  <span key={sub} className="dash-admin-subreddit-chip">r/{sub} ({count})</span>
-                ))}
-              </div>
-            </div>
-          </div>
+          </CollapsibleSection>
 
-          {/* Upgrade requests — recorded interest, not real billing yet */}
-          <div className="admin-card" style={{ marginBottom: 20 }}>
-            <h3 className="admin-card-title">💳 Upgrade requests ({(adminData.upgradeRequests || []).length})</h3>
-            <p className="admin-card-sub">Users who tapped "Get [plan]" on the Billing page before checkout was live</p>
-            {(adminData.upgradeRequests || []).length === 0 ? (
-              <p className="admin-card-empty">No upgrade requests yet.</p>
-            ) : (
-              <div className="admin-user-table">
-                {adminData.upgradeRequests.map((r, i) => (
-                  <div key={i} className="admin-user-row">
-                    <div className="admin-user-info">
-                      <span className="admin-user-name">{r.email || r.user_id}</span>
-                      <span className="admin-user-meta">wants {r.requested_plan} · {formatRelative(r.created_at)}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* User table */}
-          <div className="admin-table-section">
+          {/* User table — the single biggest contributor to scroll length,
+              so this one defaults closed even though the others above it
+              default open when they have content; opening it is one tap
+              away and nothing about it changed otherwise. */}
+          <CollapsibleSection title={`👥 All users (${filteredUsers.length})`} storageKey="all-users" defaultOpen={false}>
+          <div className="admin-table-section" style={{ marginBottom: 0 }}>
             <div className="admin-table-header">
               <h2 className="admin-table-title">All users ({filteredUsers.length})</h2>
               <div className="admin-table-controls">
@@ -457,6 +635,117 @@ export default function Admin() {
               })}
             </div>
           </div>
+          </CollapsibleSection>
+
+          {/* ─── Admin X-lead watchlist (#4) ─────────────────────────── */}
+          <div className="admin-table-section" style={{ marginBottom: 20 }}>
+            <div className="admin-table-header">
+              <h2 className="admin-table-title">🎯 X-lead watchlist</h2>
+              <div className="admin-table-controls">
+                {watchlistData?.isRunning ? (
+                  <button className="admin-watchlist-stop-btn" onClick={handleWatchlistStop} disabled={watchlistBusy}>
+                    {watchlistBusy ? 'Stopping...' : '⏹ Stop batch'}
+                  </button>
+                ) : (
+                  <button
+                    className="admin-watchlist-run-btn"
+                    onClick={handleWatchlistRun}
+                    disabled={watchlistBusy || !(watchlistData?.pendingCount > 0)}
+                  >
+                    {watchlistBusy ? 'Starting...' : `▶ Run batch (${watchlistData?.pendingCount || 0} pending)`}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <p className="admin-card-sub">
+              One pair per line: <code>&lt;productUrl&gt; &lt;xPostUrl&gt;</code>, whitespace-separated.
+              {watchlistData?.isRunning && !watchlistData?.isStalled && <span className="admin-watchlist-running-badge"> ● Batch running — last activity {formatRelative(watchlistData.lastActivityAt)}</span>}
+            </p>
+
+            {watchlistData?.isStalled && (
+              <div className="admin-watchlist-stalled-banner">
+                <span>
+                  ⚠ No activity {watchlistData.lastActivityAt ? `since ${formatRelative(watchlistData.lastActivityAt)}` : 'ever recorded'} — the batch has likely died.
+                  Stop should already clear this, but if items are stuck mid-scan, use Force reset.
+                </span>
+                <button className="admin-watchlist-force-reset-btn" onClick={handleWatchlistForceReset} disabled={watchlistBusy}>
+                  Force reset
+                </button>
+              </div>
+            )}
+
+            <textarea
+              className="admin-watchlist-textarea"
+              placeholder={'https://example.com https://x.com/someuser/status/123...\nhttps://another.com https://x.com/otheruser/status/456...'}
+              value={watchlistPasteText}
+              onChange={e => setWatchlistPasteText(e.target.value)}
+              rows={4}
+            />
+            <div className="admin-watchlist-add-row">
+              <button className="admin-watchlist-add-btn" onClick={handleWatchlistAdd} disabled={watchlistAdding || !watchlistPasteText.trim()}>
+                {watchlistAdding ? 'Adding...' : 'Add to watchlist'}
+              </button>
+              {watchlistAddResult && (
+                <span className="admin-watchlist-add-result">
+                  Added {watchlistAddResult.inserted}
+                  {watchlistAddResult.skipped?.length > 0 && `, skipped ${watchlistAddResult.skipped.length} (${watchlistAddResult.skipped.map(s => `line ${s.line}: ${s.reason}`).join('; ')})`}
+                </span>
+              )}
+            </div>
+
+            {!watchlistData?.items?.length ? (
+              <p className="admin-card-empty">Nothing in the watchlist yet.</p>
+            ) : (
+              <div className="admin-watchlist-list">
+                {watchlistData.items.map(item => (
+                  <div key={item.id} className="admin-watchlist-row">
+                    <div className="admin-watchlist-row-top">
+                      <span className={`admin-watchlist-status admin-watchlist-status-${item.status}`}>{item.status}</span>
+                      <a href={item.product_url} target="_blank" rel="noreferrer" className="admin-watchlist-link">{item.product_url}</a>
+                      <a href={item.x_post_url} target="_blank" rel="noreferrer" className="admin-watchlist-link admin-watchlist-link-x">Reply ↗</a>
+                    </div>
+                    <div className="admin-watchlist-row-bottom">
+                      {item.status === 'done' && item.share_token && (
+                        <>
+                          <button
+                            className="admin-watchlist-copy-btn"
+                            onClick={() => { navigator.clipboard?.writeText(`https://kairo-omega.vercel.app/share/${item.share_token}`) }}
+                          >
+                            📋 Copy share link
+                          </button>
+                          <span className="admin-watchlist-meta">{item.lead_count} leads · top score {item.top_score}</span>
+                          <span className="admin-watchlist-meta">{item.viewCount} view{item.viewCount === 1 ? '' : 's'}{item.lastViewedAt ? ` · last viewed ${formatRelative(item.lastViewedAt)}` : ''}</span>
+                        </>
+                      )}
+                      {item.status === 'error' && <span className="admin-watchlist-error">{item.error_message}</span>}
+                      <span className="admin-watchlist-meta">{formatRelative(item.created_at)}</span>
+                      {item.status !== 'scanning' && (
+                        <button
+                          className="admin-watchlist-delete-btn"
+                          onClick={() => handleWatchlistDelete(item.id, item.product_url)}
+                          title="Remove from watchlist"
+                        >
+                          🗑
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Analytics now lives on its own page (/admin-analytics) rather
+              than an inline expandable section — opening it used to add
+              the whole funnel/journeys/events dashboard's worth of height
+              to this page even when collapsed-by-default helped. This is
+              just a link now; same data, same filters, same owner-device
+              toggle, all still there on the other end. */}
+          <Link href="/admin-analytics" className="admin-analytics-link-card">
+            <span>📈 Analytics</span>
+            <span className="admin-analytics-link-arrow">→</span>
+          </Link>
 
           {/* Cleanup tool */}
           <div className="admin-cleanup-section">

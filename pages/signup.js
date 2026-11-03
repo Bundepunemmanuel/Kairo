@@ -3,6 +3,7 @@ import Link from 'next/link'
 import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
+import { track } from './_app'
 
 export default function Signup() {
   const router = useRouter()
@@ -42,6 +43,7 @@ export default function Signup() {
       // If email confirmations are OFF in Supabase, signUp returns a session
       // immediately and the user is already logged in — skip straight to onboarding.
       if (data?.session) {
+        track('signup_completed', { method: 'immediate' })
         router.push('/onboarding')
         return
       }

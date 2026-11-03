@@ -149,7 +149,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
   const [quotaSecondsLeft, setQuotaSecondsLeft] = useState(0)
 
   useEffect(() => {
-    track('share_page_viewed', { status })
+    track('share_page_viewed', { status, token })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 

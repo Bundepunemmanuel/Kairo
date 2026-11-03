@@ -281,6 +281,367 @@ export default async function handler(req, res) {
       return res.status(200).json({ message: held ? 'Account held' : 'Account released' })
     }
 
+    // ─── Admin X-lead watchlist (#4) ───────────────────────────────────────
+    // Bulk-add — one pair per line, strictly `<productUrl> <xPostUrl>`
+    // (whitespace-separated). Lines that don't parse into exactly two
+    // URLs are reported back rather than silently dropped, so a typo'd
+    // line doesn't just vanish from what was pasted.
+    if (action === 'watchlist-add') {
+      const { pairs } = req.body
+      if (!pairs || typeof pairs !== 'string' || !pairs.trim()) {
+        return res.status(400).json({ error: 'Nothing pasted' })
+      }
+
+      const isUrl = str => {
+        try { new URL(str.startsWith('http') ? str : `https://${str}`); return true }
+        catch { return false }
+      }
+
+      const lines = pairs.split('\n').map(l => l.trim()).filter(Boolean)
+      const toInsert = []
+      const skipped = []
+
+      lines.forEach((line, i) => {
+        const tokens = line.split(/\s+/).filter(Boolean)
+        if (tokens.length !== 2) {
+          skipped.push({ line: i + 1, text: line, reason: tokens.length < 2 ? 'Missing a URL — expected exactly 2 per line' : 'Too many URLs on this line — expected exactly 1 product URL + 1 X post URL' })
+          return
+        }
+        const [productUrl, xPostUrl] = tokens
+        if (!isUrl(productUrl) || !isUrl(xPostUrl)) {
+          skipped.push({ line: i + 1, text: line, reason: 'One or both tokens aren\u2019t valid URLs' })
+          return
+        }
+        toInsert.push({ product_url: productUrl, x_post_url: xPostUrl, status: 'pending' })
+      })
+
+      if (toInsert.length) {
+        const { error } = await supabaseAdmin.from('watchlist_items').insert(toInsert)
+        if (error) throw error
+      }
+
+      return res.status(200).json({ inserted: toInsert.length, skipped })
+    }
+
+    // List every watchlist item plus live control state and, for items
+    // that reached 'done', their per-share view count/last-viewed time
+    // (#6) pulled from visitor_events by matching share_token against
+    // properties->>'token' on share_page_viewed rows.
+    if (action === 'watchlist-list') {
+      const { data: items, error: itemsErr } = await supabaseAdmin
+        .from('watchlist_items')
+        .select('id, product_url, x_post_url, status, share_token, lead_count, top_score, error_message, created_at, updated_at')
+        .order('created_at', { ascending: false })
+        .limit(500)
+      if (itemsErr) throw itemsErr
+
+      const { data: control } = await supabaseAdmin
+        .from('watchlist_control')
+        .select('is_running, cancel_requested, last_activity_at')
+        .eq('id', 'global')
+        .maybeSingle()
+
+      // A slice is supposed to either finish or re-stamp the heartbeat
+      // within well under the 2-minute self-reschedule interval. 3
+      // minutes with no heartbeat while is_running is still true is a
+      // real signal the chain died, not normal in-between-slices quiet.
+      const isStalled = !!(
+        control?.is_running &&
+        (!control.last_activity_at || Date.now() - new Date(control.last_activity_at).getTime() > 3 * 60 * 1000)
+      )
+
+      const tokens = (items || []).map(i => i.share_token).filter(Boolean)
+      let viewsByToken = {}
+      if (tokens.length) {
+        const { data: viewRows } = await supabaseAdmin
+          .from('visitor_events')
+          .select('properties, created_at')
+          .eq('event_type', 'share_page_viewed')
+          .in('properties->>token', tokens)
+        ;(viewRows || []).forEach(r => {
+          const t = r.properties?.token
+          if (!t) return
+          if (!viewsByToken[t]) viewsByToken[t] = { count: 0, lastViewedAt: null }
+          viewsByToken[t].count++
+          if (!viewsByToken[t].lastViewedAt || new Date(r.created_at) > new Date(viewsByToken[t].lastViewedAt)) {
+            viewsByToken[t].lastViewedAt = r.created_at
+          }
+        })
+      }
+
+      const itemsWithViews = (items || []).map(i => ({
+        ...i,
+        viewCount: i.share_token ? (viewsByToken[i.share_token]?.count || 0) : 0,
+        lastViewedAt: i.share_token ? (viewsByToken[i.share_token]?.lastViewedAt || null) : null,
+      }))
+
+      const pendingCount = (items || []).filter(i => i.status === 'pending').length
+
+      return res.status(200).json({
+        items: itemsWithViews,
+        isRunning: control?.is_running || false,
+        cancelRequested: control?.cancel_requested || false,
+        lastActivityAt: control?.last_activity_at || null,
+        isStalled,
+        pendingCount,
+      })
+    }
+
+    // Kicks off the batch by firing the first slice DIRECTLY, right now —
+    // not through schedule_watchlist_followup. That RPC's delayed-cron
+    // trick only exists to create a genuine future delay for the
+    // 2-minute self-reschedule gap BETWEEN slices (see index.ts's
+    // runWatchlistScan); there's no reason to delay the very first slice
+    // at all, and doing so was the actual bug that left the batch
+    // permanently stuck — a 5-second buffer was too tight for pg_cron's
+    // minute-granularity scheduling to reliably land before the target
+    // minute, and a missed minute on a day+month-specific one-shot
+    // expression doesn't retry, it just waits up to a year.
+    //
+    // net.http_post isn't involved here at all for this call — this is a
+    // plain fetch from Node straight to the Edge Function. The short
+    // AbortSignal.timeout below is NOT an error condition: a slice can
+    // take up to ~150s, and this handler has no reason to wait for it —
+    // it only needs to confirm the request was actually dispatched before
+    // returning, so Vercel doesn't freeze this function before the
+    // request even leaves. A timeout is the expected outcome; only a
+    // genuine connection-level failure (DNS, refused, immediate error
+    // response) should roll back is_running.
+    if (action === 'watchlist-run') {
+      await supabaseAdmin.from('watchlist_control').upsert(
+        { id: 'global', is_running: true, cancel_requested: false, updated_at: new Date().toISOString() },
+        { onConflict: 'id' }
+      )
+
+      try {
+        await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/cron-scan?task=watchlist-scan`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}` },
+          body: '{}',
+          signal: AbortSignal.timeout(8000),
+        })
+      } catch (e) {
+        if (e.name !== 'AbortError' && e.name !== 'TimeoutError') {
+          await supabaseAdmin.from('watchlist_control').update({ is_running: false }).eq('id', 'global')
+          throw e
+        }
+        // Expected: the 8s window closed before the slice finished its
+        // own ~150s of work. The slice is still running server-side.
+      }
+
+      return res.status(200).json({ message: 'Batch starting' })
+    }
+
+    // Sets BOTH is_running=false (immediate, for the admin's own view of
+    // reality) AND cancel_requested=true (for a genuinely live
+    // invocation, checked before each item in its current slice — see
+    // index.ts's runWatchlistScan — so a real in-flight batch still never
+    // gets an item half-processed). Previously this only set
+    // cancel_requested and left is_running for some future invocation to
+    // clear — which meant a chain that had already died (e.g. from the
+    // schema-cron permission error) left is_running stuck true forever,
+    // since nothing was left running to ever read the flag. Pressing Stop
+    // should always be able to make the UI stop claiming a batch is
+    // running, whether or not anything is actually still executing.
+    if (action === 'watchlist-stop') {
+      const { error } = await supabaseAdmin
+        .from('watchlist_control')
+        .update({ is_running: false, cancel_requested: true, updated_at: new Date().toISOString() })
+        .eq('id', 'global')
+      if (error) throw error
+
+      return res.status(200).json({ message: 'Stopped' })
+    }
+
+    // Recovery for exactly the stuck-state scenario above: clears
+    // is_running/cancel_requested AND resets any item still marked
+    // 'scanning' back to 'pending'. The 'scanning' reset matters because
+    // if the Edge Function's whole process gets killed mid-item (a hard
+    // platform-level timeout, not a caught exception — processWatchlistItem's
+    // own try/catch already handles every other failure by marking the
+    // item 'error'), that item would otherwise sit on 'scanning' forever:
+    // the pending-only query in runWatchlistScan would never pick it up
+    // again, and it wouldn't show as failed either — just invisible.
+    if (action === 'watchlist-force-reset') {
+      const { error: controlErr } = await supabaseAdmin
+        .from('watchlist_control')
+        .update({ is_running: false, cancel_requested: false, updated_at: new Date().toISOString() })
+        .eq('id', 'global')
+      if (controlErr) throw controlErr
+
+      const { data: resetItems, error: itemsErr } = await supabaseAdmin
+        .from('watchlist_items')
+        .update({ status: 'pending', updated_at: new Date().toISOString() })
+        .eq('status', 'scanning')
+        .select('id')
+      if (itemsErr) throw itemsErr
+
+      return res.status(200).json({ message: 'Reset', itemsRequeued: resetItems?.length || 0 })
+    }
+
+    // Deletes one item outright. Blocked for 'scanning' status — that's
+    // the one state where an in-flight invocation might still write back
+    // to this exact row (processWatchlistItem's final status/token
+    // update), so deleting it out from under that write could leave a
+    // confusing half-state. pending/done/error are always safe to remove.
+    if (action === 'watchlist-delete') {
+      const { id } = req.body
+      if (!id) return res.status(400).json({ error: 'id is required' })
+
+      const { data: existing, error: fetchErr } = await supabaseAdmin
+        .from('watchlist_items')
+        .select('status')
+        .eq('id', id)
+        .maybeSingle()
+      if (fetchErr) throw fetchErr
+      if (existing?.status === 'scanning') {
+        return res.status(400).json({ error: 'This item is actively being scanned right now — wait for it to finish or error out before deleting it' })
+      }
+
+      const { error: deleteErr } = await supabaseAdmin.from('watchlist_items').delete().eq('id', id)
+      if (deleteErr) throw deleteErr
+
+      return res.status(200).json({ message: 'Deleted' })
+    }
+
+    // ─── Self-hosted analytics (#5) ─────────────────────────────────────────
+    // Everything computed here server-side from visitor_events, filtered
+    // by time window and whether to include the owner's own browser(s).
+    if (action === 'get-analytics-data') {
+      const hoursBack = Number(req.body.hoursBack) || 168 // default 7 days
+      const includeOwner = !!req.body.includeOwner
+      const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString()
+
+      let query = supabaseAdmin
+        .from('visitor_events')
+        .select('event_type, visitor_id, device_type, is_owner, properties, created_at')
+        .gte('created_at', since)
+        .limit(20000)
+      if (!includeOwner) query = query.eq('is_owner', false)
+
+      const { data: events, error: eventsErr } = await query
+      if (eventsErr) throw eventsErr
+      const rows = events || []
+
+      const uniqueVisitorsFor = eventType => new Set(rows.filter(r => r.event_type === eventType).map(r => r.visitor_id)).size
+
+      // Main conversion funnel — unique visitors per step, drop-off % vs
+      // the step before it. zero_results_shown is deliberately NOT in
+      // this list (see branchRate below) — it's a fork after
+      // scan_completed, not a step on the way to signup.
+      // monitoring_activated (added alongside this) is the real finish
+      // line — an account with no product_profiles row never gets
+      // scanned again, so notify_me_completed alone overstates activation.
+      // signup_completed (the separate direct /signup page path, also
+      // newly tracked) isn't folded in here yet — it's a materially
+      // different entry point than the scan-first onboarding flow this
+      // funnel describes, and merging them needs a closer look at how the
+      // two actually relate before changing what this funnel measures.
+      // It still shows up in the "other events" bucket below for now.
+      const MAIN_FUNNEL = ['page_view', 'hero_cta_clicked', 'scan_started', 'scan_completed', 'notify_me_completed', 'monitoring_activated']
+      let prevCount = null
+      const funnel = MAIN_FUNNEL.map(step => {
+        const count = uniqueVisitorsFor(step)
+        const dropOffPct = prevCount === null || prevCount === 0 ? 0 : Math.round((1 - count / prevCount) * 1000) / 10
+        prevCount = count
+        return { step, uniqueVisitors: count, dropOffPct }
+      })
+
+      const scanCompletedCount = uniqueVisitorsFor('scan_completed')
+      const zeroResultsCount = uniqueVisitorsFor('zero_results_shown')
+      const branchRate = {
+        scanCompleted: scanCompletedCount,
+        zeroResultsShown: zeroResultsCount,
+        zeroResultsPct: scanCompletedCount === 0 ? 0 : Math.round((zeroResultsCount / scanCompletedCount) * 1000) / 10,
+      }
+
+      // Share-link sub-funnel — the /share/[token] page's own flow,
+      // separate from the main funnel above (#6 ties view counts to the
+      // same share_page_viewed event, per-token, in watchlist-list).
+      const SHARE_FUNNEL = ['share_page_viewed', 'share_notify_opened', 'share_notify_submitted', 'share_notify_completed']
+      let prevShareCount = null
+      const shareFunnel = SHARE_FUNNEL.map(step => {
+        const count = uniqueVisitorsFor(step)
+        const dropOffPct = prevShareCount === null || prevShareCount === 0 ? 0 : Math.round((1 - count / prevShareCount) * 1000) / 10
+        prevShareCount = count
+        return { step, uniqueVisitors: count, dropOffPct }
+      })
+
+      // Which product URLs most often show zero results — requires
+      // zero_results_shown to carry a `url` property (added in
+      // onboarding.js alongside this feature).
+      const zeroResultUrlCounts = {}
+      rows.filter(r => r.event_type === 'zero_results_shown').forEach(r => {
+        const url = r.properties?.url || '(unknown — scanned before url tracking was added)'
+        zeroResultUrlCounts[url] = (zeroResultUrlCounts[url] || 0) + 1
+      })
+      const topZeroResultUrls = Object.entries(zeroResultUrlCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([url, count]) => ({ url, count }))
+
+      // Device breakdown — unique visitors per device type, measured off
+      // page_view (the most representative baseline of real traffic,
+      // rather than raw event counts which one active visitor can skew).
+      const deviceCounts = {}
+      const seenForDevice = new Set()
+      rows.filter(r => r.event_type === 'page_view').forEach(r => {
+        const key = r.visitor_id
+        if (seenForDevice.has(key)) return
+        seenForDevice.add(key)
+        const d = r.device_type || 'unknown'
+        deviceCounts[d] = (deviceCounts[d] || 0) + 1
+      })
+
+      // Any event type not already covered above.
+      const coveredTypes = new Set([...MAIN_FUNNEL, ...SHARE_FUNNEL, 'zero_results_shown'])
+      const otherCounts = {}
+      rows.forEach(r => {
+        if (coveredTypes.has(r.event_type)) return
+        if (!otherCounts[r.event_type]) otherCounts[r.event_type] = { count: 0, visitors: new Set() }
+        otherCounts[r.event_type].count++
+        otherCounts[r.event_type].visitors.add(r.visitor_id)
+      })
+      const otherEvents = Object.entries(otherCounts)
+        .map(([eventType, v]) => ({ eventType, count: v.count, uniqueVisitors: v.visitors.size }))
+        .sort((a, b) => b.count - a.count)
+
+      // Real recent visitor journeys — actual event sequences, not just
+      // aggregate counts. Most-recently-active 20 visitors, each with
+      // their events in this window in order.
+      const lastSeenByVisitor = {}
+      rows.forEach(r => {
+        if (!lastSeenByVisitor[r.visitor_id] || new Date(r.created_at) > new Date(lastSeenByVisitor[r.visitor_id])) {
+          lastSeenByVisitor[r.visitor_id] = r.created_at
+        }
+      })
+      const recentVisitorIds = Object.entries(lastSeenByVisitor)
+        .sort((a, b) => new Date(b[1]) - new Date(a[1]))
+        .slice(0, 20)
+        .map(([id]) => id)
+
+      const recentJourneys = recentVisitorIds.map(visitorId => {
+        const visitorEvents = rows
+          .filter(r => r.visitor_id === visitorId)
+          .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+          .map(r => ({ eventType: r.event_type, createdAt: r.created_at, deviceType: r.device_type, properties: r.properties }))
+        return { visitorId, deviceType: visitorEvents[0]?.deviceType || 'unknown', events: visitorEvents }
+      })
+
+      return res.status(200).json({
+        windowHours: hoursBack,
+        includeOwner,
+        totalEvents: rows.length,
+        funnel,
+        branchRate,
+        shareFunnel,
+        topZeroResultUrls,
+        deviceBreakdown: deviceCounts,
+        otherEvents,
+        recentJourneys,
+      })
+    }
+
     return res.status(400).json({ error: 'Unknown action' })
   } catch (err) {
     console.error('[admin] error:', err.message)
