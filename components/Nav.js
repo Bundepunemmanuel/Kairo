@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { supabase } from '../lib/supabase'
-import { useAuth } from '../pages/_app'
+import { useAuth, track } from '../pages/_app'
 
 export function KairoLogo({ size = 24 }) {
   return <img src="/logo.png" alt="Kairo" width={size} height={size} style={{ objectFit: 'contain' }} />
@@ -50,7 +50,13 @@ export default function Nav({ solid = false }) {
             ) : (
               <>
                 <Link href="/login" className="nav-link">Login</Link>
-                <Link href="/signup" className="nav-cta">Sign up free</Link>
+                {/* Every other CTA on the site (hero, mobile menu, pricing)
+                    routes through /onboarding — scan first, see real leads
+                    for your own product, then create an account. This was
+                    the one holdout pointing straight at a cold /signup
+                    form with no product context, competing against the
+                    better path for the whole time someone's on the page. */}
+                <Link href="/onboarding" className="nav-cta" onClick={() => track('hero_cta_clicked', { source: 'nav' })}>Sign up free</Link>
               </>
             )}
           </div>

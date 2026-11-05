@@ -11,12 +11,12 @@ const STATS = [
   { value: '2 min', label: 'To your first lead' },
   { value: '847', label: 'Posts scanned daily' },
   { value: '92.0', label: 'Avg intent score' },
-  { value: '23m', label: 'Avg lead window' },
+  { value: '24h', label: 'Lead window' },
 ]
 
 const STEPS = [
   { n: '01', title: 'Paste your site URL', desc: 'Drop your landing page URL. Kairo reads your product, understands your customer, and maps the subreddits where they hang out.' },
-  { n: '02', title: 'Kairo hunts', desc: 'Our engine scans Reddit every 15 minutes. Every post is scored for buying intent, pain signals, and competitor frustration.' },
+  { n: '02', title: 'Kairo hunts', desc: 'Our engine scans Reddit every hour. Every post is scored for buying intent, pain signals, and competitor frustration.' },
   { n: '03', title: 'You see real leads', desc: 'Active or passive demand — each lead is labeled, scored, and comes with a decay timer so you know exactly how long you have.' },
   { n: '04', title: 'Reply with confidence', desc: 'Kairo drafts the reply for you. Value-first, human-sounding, calibrated to the signal type. One click opens the Reddit thread.' },
 ]
@@ -69,18 +69,18 @@ export default function Home() {
   return (
     <>
       <Head>
-        <title>Kairo App — AI Reddit Lead Generation for Founders</title>
-        <meta name="description" content="Kairo is the app that scans Reddit 24/7 and surfaces people actively looking for products like yours. Stop searching manually. Start waking up to customers." />
-        <meta property="og:title" content="Kairo — AI Reddit Lead Generation for Founders" />
-        <meta property="og:description" content="Kairo scans Reddit 24/7 and surfaces people actively looking for products like yours." />
+        <title>Kairo — Find customers already asking for your product on Reddit</title>
+        <meta name="description" content="Kairo reads your actual product, not a list of keywords — then finds the Reddit threads where someone's specifically describing the problem you solve, scores how urgent it is, and drafts your reply." />
+        <meta property="og:title" content="Kairo — Find customers already asking for your product on Reddit" />
+        <meta property="og:description" content="Kairo reads your actual product, not a list of keywords — then finds people on Reddit specifically describing the problem you solve." />
         <meta property="og:type" content="website" />
         <meta property="og:url" content="https://kairo-omega.vercel.app/" />
         <meta property="og:image" content="https://kairo-omega.vercel.app/api/og?v=2" />
         <meta property="og:image:width" content="1200" />
         <meta property="og:image:height" content="630" />
         <meta name="twitter:card" content="summary_large_image" />
-        <meta name="twitter:title" content="Kairo — AI Reddit Lead Generation for Founders" />
-        <meta name="twitter:description" content="Kairo scans Reddit 24/7 and surfaces people actively looking for products like yours." />
+        <meta name="twitter:title" content="Kairo — Find customers already asking for your product on Reddit" />
+        <meta name="twitter:description" content="Kairo reads your actual product, not a list of keywords — then finds people on Reddit specifically describing the problem you solve." />
         <meta name="twitter:image" content="https://kairo-omega.vercel.app/api/og?v=2" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
@@ -101,6 +101,9 @@ export default function Home() {
           </h1>
           <p className="hero-sub">
             Your next 10 customers are on Reddit right now — frustrated, asking for recommendations, ready to buy. Kairo finds them, scores their intent, and writes your reply. Before your competitor does.
+          </p>
+          <p className="hero-differentiator">
+            Not a keyword alert. Kairo reads your actual product, then matches posts where someone's describing the exact problem it solves.
           </p>
           <div className="hero-ctas">
             <Link href="/onboarding" className="btn-primary" onClick={() => track('hero_cta_clicked', { source: 'hero' })}>Find My First Customer →</Link>

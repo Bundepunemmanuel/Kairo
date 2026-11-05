@@ -143,6 +143,8 @@ export default function SharePage({ token, initialStatus, initialData }) {
   const [notifyStage, setNotifyStage] = useState('form') // form | scanning | done
   const [notifyError, setNotifyError] = useState('')
   const [notifyExisting, setNotifyExisting] = useState(false)
+  const [sessionAccessToken, setSessionAccessToken] = useState(null)
+  const [pushOptInStatus, setPushOptInStatus] = useState('idle') // idle | requesting | granted | denied | error
 
   // ── Shared Reddit quota countdown — see onboarding.js for full reasoning ──
   const [quotaResetAt, setQuotaResetAt] = useState(null)
@@ -266,21 +268,17 @@ export default function SharePage({ token, initialStatus, initialData }) {
         }).catch(() => {})
       }
 
-      // Push subscription is best-effort — a denial or an iOS visitor who
-      // hasn't installed yet still gets a real watched account below.
-      let subscription = null
-      if (pushIsSupported() && !needsHomeScreenInstructions()) {
-        try {
-          subscription = await subscribeToPush()
-        } catch (e) {
-          console.log('[share] push subscribe error:', e.message)
-        }
-      }
-
+      // No push subscription sent here — account creation and the browser
+      // notification permission prompt are kept as two separate choices
+      // now, not bundled into one click. The prompt used to fire
+      // automatically the moment this form was submitted, before the
+      // person had actually asked for browser alerts specifically; it's
+      // now offered as its own explicit button in the success state
+      // below, via handlePushOptIn / /api/register-push.
       const captureRes = await fetch('/api/capture-lead', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: trimmedEmail, url: cleanUrl, analysis: productAnalysis, leads: scoredLeads, subscription }),
+        body: JSON.stringify({ email: trimmedEmail, url: cleanUrl, analysis: productAnalysis, leads: scoredLeads, subscription: null }),
       })
       const captureData = await captureRes.json()
       if (!captureRes.ok) throw new Error(captureData.error || 'Something went wrong. Please try again.')
@@ -292,6 +290,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
           access_token: captureData.session.access_token,
           refresh_token: captureData.session.refresh_token,
         })
+        setSessionAccessToken(captureData.session.access_token)
       }
       track('share_notify_completed', { existingAccount: !!captureData.existingAccount })
       setNotifyStage('done')
@@ -299,6 +298,31 @@ export default function SharePage({ token, initialStatus, initialData }) {
       console.log('[share] notify-me error:', e.message)
       setNotifyError(e.message || 'Something went wrong. Please try again.')
       setNotifyStage('form')
+    }
+  }
+
+  // Separate, explicit action — only ever fires from the person tapping
+  // this specific button, never as a side effect of anything else. The
+  // browser's native permission prompt only appears here, after account
+  // creation already succeeded, not bundled into that earlier step.
+  const handlePushOptIn = async () => {
+    if (!sessionAccessToken) return
+    setPushOptInStatus('requesting')
+    try {
+      const subscription = await subscribeToPush()
+      const res = await fetch('/api/register-push', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscription, accessToken: sessionAccessToken }),
+      })
+      if (!res.ok) throw new Error('save failed')
+      setPushOptInStatus('granted')
+    } catch (e) {
+      // subscribeToPush throws (rather than returning null) specifically
+      // when the browser permission prompt was denied — distinguished
+      // here so the button can say "blocked" instead of a generic error.
+      console.log('[share] push opt-in error:', e.message)
+      setPushOptInStatus(e.code === 'permission_denied' ? 'denied' : 'error')
     }
   }
 
@@ -384,7 +408,13 @@ export default function SharePage({ token, initialStatus, initialData }) {
             <KairoLogo size={22} />
             <span style={{ fontFamily: 'var(--font-display)', fontSize: '1.15rem', fontWeight: 700, color: 'var(--ink)' }}>Kairo</span>
           </Link>
-          <Link href="/signup" style={{ fontSize: '0.88rem', fontWeight: 600, color: 'var(--rust)', textDecoration: 'none' }}>Sign up</Link>
+          {/* Was /signup — a cold form with zero product context, sitting
+              in the exact spot a visitor checks first, letting them skip
+              every lead and every bit of proof on this page before being
+              asked to commit. Same fix as Nav.js: route through the
+              scan-first flow instead, since this page builds its own nav
+              separately and never got that fix. */}
+          <Link href="/onboarding" style={{ fontSize: '0.88rem', fontWeight: 600, color: 'var(--rust)', textDecoration: 'none' }}>Sign up</Link>
         </nav>
 
         <div className="ob-results">
@@ -407,7 +437,10 @@ export default function SharePage({ token, initialStatus, initialData }) {
                     : 'No qualifying leads in this scan'}
                 </h2>
                 <p className="leads-sub">
-                  Scanned {new Date(created_at).toLocaleDateString()} · This link expires in {daysRemaining} {daysRemaining === 1 ? 'day' : 'days'}
+                  One scan found this. Reddit doesn't stop — new people post like this every day, and nobody's watching for them until something is.
+                </p>
+                <p className="leads-sub leads-sub-meta">
+                  Scanned {new Date(created_at).toLocaleDateString()} · This specific link expires in {daysRemaining} {daysRemaining === 1 ? 'day' : 'days'}
                 </p>
               </div>
             </div>
@@ -494,14 +527,19 @@ export default function SharePage({ token, initialStatus, initialData }) {
             {/* ── Conversion CTAs ── */}
             <div className="email-gate">
               <div className="email-gate-inner">
-                <h3 className="email-gate-headline">Want Kairo watching for leads like these on your own product?</h3>
-
-                <div className="share-cta-row">
-                  <Link href="/signup" className="ob-scan-btn" style={{ textAlign: 'center', textDecoration: 'none', flex: 1 }}>
-                    Start finding leads free
-                  </Link>
-                </div>
-                <p className="email-gate-note" style={{ marginBottom: 14 }}>No credit card. See what Kairo finds for you.</p>
+                <h3 className="email-gate-headline">The alternative to this is checking Reddit yourself, every day, by hand.</h3>
+                <p className="email-gate-subheadline">Kairo already found these without anyone searching for them. Point it at your own product and it keeps finding more — automatically, every day.</p>
+                {/* Previously this box had two competing CTAs: a straight
+                    /signup link with no product context (primary styling)
+                    stacked on top of this same inline scan form
+                    (secondary styling) — same destination, different
+                    friction, and the WORSE one (no proof shown) was both
+                    first and more prominent. One CTA now: the scan form
+                    below, which is what everything else on the site
+                    (hero, nav, mobile menu, pricing) already routes
+                    through — it proves the value before asking for
+                    anything, the same thing this entire page already did
+                    for the product being shared. */}
 
                 {notifyStage === 'done' ? (
                   <div className="email-success">
@@ -519,6 +557,27 @@ export default function SharePage({ token, initialStatus, initialData }) {
                         <Link href="/dashboard" style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--rust)' }}>
                           Go to your dashboard →
                         </Link>
+                      )}
+                      {/* Separate from the account creation above — the
+                          permission prompt only fires from this button,
+                          never automatically. Email already covers
+                          notification; this is specifically for anyone
+                          who also wants a browser alert the moment
+                          something matches. */}
+                      {!notifyExisting && sessionAccessToken && pushIsSupported() && !needsHomeScreenInstructions() && pushOptInStatus !== 'granted' && (
+                        <div style={{ marginTop: 10 }}>
+                          <button
+                            className="lead-btn-secondary"
+                            onClick={handlePushOptIn}
+                            disabled={pushOptInStatus === 'requesting'}
+                            style={{ fontSize: '0.8rem' }}
+                          >
+                            {pushOptInStatus === 'requesting' ? 'Requesting...' : pushOptInStatus === 'denied' ? 'Browser notifications blocked' : pushOptInStatus === 'error' ? 'Couldn\u2019t turn on alerts — try again' : '🔔 Also alert me in this browser'}
+                          </button>
+                        </div>
+                      )}
+                      {pushOptInStatus === 'granted' && (
+                        <p className="email-gate-note" style={{ marginTop: 10, marginBottom: 0 }}>✓ Browser alerts on</p>
                       )}
                     </div>
                   </div>
@@ -561,14 +620,14 @@ export default function SharePage({ token, initialStatus, initialData }) {
                   </>
                 ) : (
                   <button
-                    className="lead-btn-secondary"
+                    className="ob-scan-btn"
                     style={{ width: '100%', textAlign: 'center' }}
                     onClick={() => { setNotifyOpen(true); track('share_notify_opened') }}
                   >
-                    Just tell us where to send them
+                    Scan my product free →
                   </button>
                 )}
-                <p className="email-gate-note">We'll scan your product and notify you the moment we find a real match — no account needed to start.</p>
+                <p className="email-gate-note">No credit card. We'll scan your product and show you what Kairo finds — no account needed to start.</p>
               </div>
             </div>
           </div>

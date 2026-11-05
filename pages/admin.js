@@ -43,6 +43,39 @@ function CollapsibleSection({ title, storageKey, defaultOpen = false, children }
   )
 }
 
+// Short, varied openers for the prefilled X reply — deterministically
+// picked per item (same item always gets the same one across visits, so
+// it doesn't shift under you between page loads) but varied across
+// different items, so replies posted across several threads don't all
+// read as the same copy-pasted line. Deliberately lowercase and short —
+// this is a reply on X, not a product pitch.
+const X_REPLY_OPENERS = [
+  'found a few people asking for exactly this on reddit —',
+  'turned up some live threads for this —',
+  'reddit\u2019s got people asking for this right now —',
+  'found real demand for this on reddit —',
+  'people are asking for this on reddit rn —',
+  'a few reddit threads matched this exactly —',
+]
+
+function pickXReplyOpener(itemId) {
+  let hash = 0
+  for (let i = 0; i < itemId.length; i++) hash = (hash * 31 + itemId.charCodeAt(i)) >>> 0
+  return X_REPLY_OPENERS[hash % X_REPLY_OPENERS.length]
+}
+
+// Builds X's reply-intent URL so the share link (and a short opener) are
+// already sitting in the compose box when it opens, instead of just
+// opening the raw post and leaving the share link to copy-paste by hand.
+// Falls back to the plain post URL if a post id can't be parsed out of it
+// (intent replies need the numeric status id specifically).
+function buildXReplyUrl(xPostUrl, shareLink, itemId) {
+  const match = (xPostUrl || '').match(/status\/(\d+)/)
+  if (!match) return xPostUrl
+  const text = `${pickXReplyOpener(itemId)} ${shareLink}`
+  return `https://twitter.com/intent/tweet?in_reply_to=${match[1]}&text=${encodeURIComponent(text)}`
+}
+
 export default function Admin() {
   const { user, loading: authLoading } = useAuth()
   const router = useRouter()
@@ -703,7 +736,14 @@ export default function Admin() {
                     <div className="admin-watchlist-row-top">
                       <span className={`admin-watchlist-status admin-watchlist-status-${item.status}`}>{item.status}</span>
                       <a href={item.product_url} target="_blank" rel="noreferrer" className="admin-watchlist-link">{item.product_url}</a>
-                      <a href={item.x_post_url} target="_blank" rel="noreferrer" className="admin-watchlist-link admin-watchlist-link-x">Reply ↗</a>
+                      <a
+                        href={item.status === 'done' && item.share_token
+                          ? buildXReplyUrl(item.x_post_url, `https://kairo-omega.vercel.app/share/${item.share_token}`, item.id)
+                          : item.x_post_url}
+                        target="_blank" rel="noreferrer" className="admin-watchlist-link admin-watchlist-link-x"
+                      >
+                        Reply ↗
+                      </a>
                     </div>
                     <div className="admin-watchlist-row-bottom">
                       {item.status === 'done' && item.share_token && (

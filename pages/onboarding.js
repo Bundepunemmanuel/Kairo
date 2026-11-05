@@ -169,6 +169,8 @@ export default function Onboarding() {
   const [captureError, setCaptureError] = useState('')
   const [captureDone, setCaptureDone] = useState(false)
   const [captureExisting, setCaptureExisting] = useState(false)
+  const [sessionAccessToken, setSessionAccessToken] = useState(null)
+  const [pushOptInStatus, setPushOptInStatus] = useState('idle') // idle | requesting | granted | denied | error
   // Set right before we mint a session for a freshly-captured account, so
   // the profile-check effect below doesn't immediately redirect to
   // /dashboard and slam them into the password gate — they should get to
@@ -578,28 +580,20 @@ export default function Onboarding() {
     track('notify_me_submitted')
 
     setCapturing(true)
-    let subscription = null
 
-    // Only attempt push where it can actually work. iOS-not-yet-installed
-    // visitors still get an account + saved scan below — they just won't
-    // get a push until they add Kairo to their home screen (see the
-    // instructions shown alongside this form) and enable it in Settings.
-    if (pushIsSupported() && !needsHomeScreenInstructions()) {
-      try {
-        subscription = await subscribeToPush()
-      } catch (e) {
-        console.log('[onboarding] push subscribe error:', e.message)
-        setCaptureError(e.code === 'permission_denied' ? e.message : 'Could not enable notifications. Please try again.')
-        setCapturing(false)
-        return
-      }
-    }
-
+    // No push subscription attempted here at all anymore. This used to
+    // call subscribeToPush() inline and, worse, BLOCK account creation
+    // entirely if the permission prompt was denied — a denied prompt is a
+    // common, low-stakes action, and having it silently kill the whole
+    // signup was a real dead end, not just a UX nitpick. Account creation
+    // and browser notifications are now two fully separate steps: this
+    // submit only ever creates the account; turning on push is offered
+    // afterward as its own explicit button once that's succeeded.
     try {
       const res = await fetch('/api/capture-lead', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: trimmedEmail, url, analysis, leads, subscription }),
+        body: JSON.stringify({ email: trimmedEmail, url, analysis, leads, subscription: null }),
       })
       const data = await res.json()
       if (!res.ok) {
@@ -618,6 +612,7 @@ export default function Onboarding() {
           access_token: data.session.access_token,
           refresh_token: data.session.refresh_token,
         })
+        setSessionAccessToken(data.session.access_token)
       }
       track('notify_me_completed', { existingAccount: !!data.existingAccount })
       setCaptureDone(true)
@@ -626,6 +621,27 @@ export default function Onboarding() {
       setCaptureError('Something went wrong. Please try again.')
     } finally {
       setCapturing(false)
+    }
+  }
+
+  // Separate, explicit action — the browser's permission prompt only
+  // appears from this button now, after account creation already
+  // succeeded, never bundled into that earlier step.
+  const handlePushOptIn = async () => {
+    if (!sessionAccessToken) return
+    setPushOptInStatus('requesting')
+    try {
+      const subscription = await subscribeToPush()
+      const res = await fetch('/api/register-push', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscription, accessToken: sessionAccessToken }),
+      })
+      if (!res.ok) throw new Error('save failed')
+      setPushOptInStatus('granted')
+    } catch (e) {
+      console.log('[onboarding] push opt-in error:', e.message)
+      setPushOptInStatus(e.code === 'permission_denied' ? 'denied' : 'error')
     }
   }
 
@@ -890,6 +906,26 @@ export default function Onboarding() {
                                 ? "We'll save this scan and start watching now. Add Kairo to your home screen (below) to get notified the moment something appears."
                                 : "We'll watch for you and notify you the moment something strong appears — no need to keep this tab open."}
                           </div>
+                          {/* Separate from account creation above — the
+                              permission prompt only fires from this
+                              button, never automatically. Previously a
+                              denied prompt could block account creation
+                              entirely; now the two are fully independent. */}
+                          {!captureExisting && sessionAccessToken && pushIsSupported() && !needsHomeScreenInstructions() && pushOptInStatus !== 'granted' && (
+                            <div style={{ marginTop: 10 }}>
+                              <button
+                                className="lead-btn-secondary"
+                                onClick={handlePushOptIn}
+                                disabled={pushOptInStatus === 'requesting'}
+                                style={{ fontSize: '0.8rem' }}
+                              >
+                                {pushOptInStatus === 'requesting' ? 'Requesting...' : pushOptInStatus === 'denied' ? 'Browser notifications blocked' : pushOptInStatus === 'error' ? 'Couldn\u2019t turn on alerts — try again' : '🔔 Also alert me in this browser'}
+                              </button>
+                            </div>
+                          )}
+                          {pushOptInStatus === 'granted' && (
+                            <p className="email-gate-note" style={{ marginTop: 10, marginBottom: 0 }}>✓ Browser alerts on</p>
+                          )}
                         </div>
                       </div>
                     ) : needsHomeScreenInstructions() ? (
