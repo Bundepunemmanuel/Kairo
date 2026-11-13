@@ -3,6 +3,17 @@
 // client-side check, since this route touches the service role key.
 // All data loading goes through here too, using the service role key,
 // so RLS never filters out other users' rows from the admin's view.
+//
+// SECURITY: authorization is verified against a real Supabase session —
+// the caller sends accessToken (session.access_token, see useAuth() in
+// _app.js), which is resolved server-side via supabaseAdmin.auth.getUser()
+// and checked against ADMIN_EMAIL. This used to accept a plain
+// requesterEmail string straight from the request body with no
+// verification at all — anyone who knew the admin's email (visible in
+// plaintext throughout this app's own UI: the user list, upgrade
+// requests) could call this endpoint directly and read or modify
+// anything it touches, no login required. That's the actual
+// vulnerability this replaces.
 
 import { createClient } from '@supabase/supabase-js'
 
@@ -16,9 +27,14 @@ const supabaseAdmin = createClient(
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
-  const { action, requesterEmail } = req.body
+  const { action, accessToken } = req.body
 
-  if (requesterEmail !== ADMIN_EMAIL) {
+  if (!accessToken) {
+    return res.status(401).json({ error: 'Not signed in' })
+  }
+
+  const { data: { user: requester }, error: authErr } = await supabaseAdmin.auth.getUser(accessToken)
+  if (authErr || !requester || requester.email !== ADMIN_EMAIL) {
     return res.status(403).json({ error: 'Not authorized' })
   }
 
@@ -330,7 +346,7 @@ export default async function handler(req, res) {
     if (action === 'watchlist-list') {
       const { data: items, error: itemsErr } = await supabaseAdmin
         .from('watchlist_items')
-        .select('id, product_url, x_post_url, status, share_token, lead_count, top_score, error_message, created_at, updated_at')
+        .select('id, product_url, x_post_url, status, share_token, lead_count, top_score, error_message, replied_at, created_at, updated_at')
         .order('created_at', { ascending: false })
         .limit(500)
       if (itemsErr) throw itemsErr
@@ -374,6 +390,17 @@ export default async function handler(req, res) {
         viewCount: i.share_token ? (viewsByToken[i.share_token]?.count || 0) : 0,
         lastViewedAt: i.share_token ? (viewsByToken[i.share_token]?.lastViewedAt || null) : null,
       }))
+
+      // Unreplied items first (newest-first within each group) — the
+      // reported problem was a day-old item needing a reply sitting
+      // buried under ten newer already-handled ones in a flat
+      // newest-first list.
+      itemsWithViews.sort((a, b) => {
+        const aReplied = !!a.replied_at
+        const bReplied = !!b.replied_at
+        if (aReplied !== bReplied) return aReplied ? 1 : -1
+        return new Date(b.created_at) - new Date(a.created_at)
+      })
 
       const pendingCount = (items || []).filter(i => i.status === 'pending').length
 
@@ -504,6 +531,138 @@ export default async function handler(req, res) {
       return res.status(200).json({ message: 'Deleted' })
     }
 
+    // Marks (or unmarks) an item as replied to. replied: true sets
+    // replied_at to now; replied: false clears it back to null — the
+    // correction path for a mistaken click or a click that didn't
+    // actually end in a posted reply.
+    if (action === 'watchlist-mark-replied') {
+      const { id, replied } = req.body
+      if (!id) return res.status(400).json({ error: 'id is required' })
+
+      const { error } = await supabaseAdmin
+        .from('watchlist_items')
+        .update({ replied_at: replied ? new Date().toISOString() : null, updated_at: new Date().toISOString() })
+        .eq('id', id)
+      if (error) throw error
+
+      return res.status(200).json({ message: replied ? 'Marked replied' : 'Marked unreplied' })
+    }
+
+    // ─── Nurture system ───────────────────────────────────────────────────
+    // Add manually, or from an already-'done' watchlist item (prefilling
+    // product_url + x contact). status defaults to 'cold' — never sent yet.
+    if (action === 'nurture-add') {
+      const { productUrl, xContact, notes } = req.body
+      if (!productUrl || !xContact) return res.status(400).json({ error: 'productUrl and xContact are required' })
+
+      const { error } = await supabaseAdmin.from('nurture_items').insert({
+        product_url: String(productUrl).slice(0, 500),
+        x_contact: String(xContact).slice(0, 500),
+        notes: notes ? String(notes).slice(0, 1000) : null,
+      })
+      if (error) throw error
+
+      return res.status(200).json({ message: 'Added to nurture list' })
+    }
+
+    // Suggested action computed per the exact rules given: never sent →
+    // send first leads; 3–5 days since last send → ready again; 3+ sends
+    // still cold → consider removing. Sorted so what needs action sits at
+    // the top, stopped items always last.
+    if (action === 'nurture-list') {
+      const { data: items, error } = await supabaseAdmin
+        .from('nurture_items')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(500)
+      if (error) throw error
+
+      const nowMs = Date.now()
+      const dayMs = 24 * 60 * 60 * 1000
+      const PRIORITY = { send_first: 0, ready_again: 0, consider_removing: 1, none: 2 }
+
+      const withSuggestion = (items || []).map(i => {
+        const daysSinceLastSent = i.last_sent_at ? Math.floor((nowMs - new Date(i.last_sent_at).getTime()) / dayMs) : null
+        let suggestedAction = null
+        let suggestionKey = 'none'
+        if (i.status !== 'stopped') {
+          if (i.times_sent === 0) { suggestedAction = 'Send first leads'; suggestionKey = 'send_first' }
+          else if (daysSinceLastSent !== null && daysSinceLastSent >= 3 && daysSinceLastSent <= 5) { suggestedAction = 'Ready to send again'; suggestionKey = 'ready_again' }
+          else if (i.times_sent >= 3 && i.status === 'cold') { suggestedAction = 'Consider removing'; suggestionKey = 'consider_removing' }
+        }
+        return { ...i, daysSinceLastSent, suggestedAction, suggestionKey }
+      })
+
+      withSuggestion.sort((a, b) => {
+        if (a.status === 'stopped' !== (b.status === 'stopped')) return a.status === 'stopped' ? 1 : -1
+        const pa = PRIORITY[a.suggestionKey] ?? 2
+        const pb = PRIORITY[b.suggestionKey] ?? 2
+        if (pa !== pb) return pa - pb
+        return new Date(b.created_at) - new Date(a.created_at)
+      })
+
+      return res.status(200).json({ items: withSuggestion })
+    }
+
+    // One click — bumps times_sent and sets last_sent_at to now. This is
+    // the step after: run a new scan, copy the new share link, reply on
+    // X, then come back here and mark it sent.
+    if (action === 'nurture-mark-sent') {
+      const { id } = req.body
+      if (!id) return res.status(400).json({ error: 'id is required' })
+
+      const { data: current, error: fetchErr } = await supabaseAdmin
+        .from('nurture_items')
+        .select('times_sent')
+        .eq('id', id)
+        .maybeSingle()
+      if (fetchErr) throw fetchErr
+      if (!current) return res.status(404).json({ error: 'Not found' })
+
+      const { error } = await supabaseAdmin
+        .from('nurture_items')
+        .update({ times_sent: (current.times_sent || 0) + 1, last_sent_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('id', id)
+      if (error) throw error
+
+      return res.status(200).json({ message: 'Marked as sent' })
+    }
+
+    if (action === 'nurture-update-status') {
+      const { id, status } = req.body
+      if (!id || !['cold', 'warm', 'interested', 'stopped'].includes(status)) {
+        return res.status(400).json({ error: 'id and a valid status are required' })
+      }
+      const { error } = await supabaseAdmin
+        .from('nurture_items')
+        .update({ status, updated_at: new Date().toISOString() })
+        .eq('id', id)
+      if (error) throw error
+
+      return res.status(200).json({ message: 'Status updated' })
+    }
+
+    if (action === 'nurture-update-notes') {
+      const { id, notes } = req.body
+      if (!id) return res.status(400).json({ error: 'id is required' })
+      const { error } = await supabaseAdmin
+        .from('nurture_items')
+        .update({ notes: notes ? String(notes).slice(0, 1000) : null, updated_at: new Date().toISOString() })
+        .eq('id', id)
+      if (error) throw error
+
+      return res.status(200).json({ message: 'Notes updated' })
+    }
+
+    if (action === 'nurture-delete') {
+      const { id } = req.body
+      if (!id) return res.status(400).json({ error: 'id is required' })
+      const { error } = await supabaseAdmin.from('nurture_items').delete().eq('id', id)
+      if (error) throw error
+
+      return res.status(200).json({ message: 'Deleted' })
+    }
+
     // ─── Self-hosted analytics (#5) ─────────────────────────────────────────
     // Everything computed here server-side from visitor_events, filtered
     // by time window and whether to include the owner's own browser(s).
@@ -525,27 +684,51 @@ export default async function handler(req, res) {
 
       const uniqueVisitorsFor = eventType => new Set(rows.filter(r => r.event_type === eventType).map(r => r.visitor_id)).size
 
-      // Main conversion funnel — unique visitors per step, drop-off % vs
-      // the step before it. zero_results_shown is deliberately NOT in
+      // Per-visitor event-type sets, built once — this is what makes the
+      // funnel below a real sequential cohort instead of independent
+      // per-step counts. The old version counted "anyone who did step N
+      // this window," which could include a visitor who did step 1 last
+      // month and step 4 this week — falsely implying they progressed
+      // through the funnel within this window when the two events may be
+      // completely unrelated. This version only counts a visitor at step
+      // N if they're still in the cohort that made it through step N-1.
+      const eventTypesByVisitor = {}
+      rows.forEach(r => {
+        if (!eventTypesByVisitor[r.visitor_id]) eventTypesByVisitor[r.visitor_id] = new Set()
+        eventTypesByVisitor[r.visitor_id].add(r.event_type)
+      })
+
+      function sequentialFunnel(steps) {
+        let cohort = null // null = no filter yet (first step)
+        let prevCount = null
+        return steps.map(step => {
+          const qualifying = new Set()
+          Object.entries(eventTypesByVisitor).forEach(([visitorId, types]) => {
+            if (cohort && !cohort.has(visitorId)) return
+            if (types.has(step)) qualifying.add(visitorId)
+          })
+          cohort = qualifying
+          const count = qualifying.size
+          const dropOffPct = prevCount === null || prevCount === 0 ? 0 : Math.round((1 - count / prevCount) * 1000) / 10
+          prevCount = count
+          return { step, uniqueVisitors: count, dropOffPct }
+        })
+      }
+
+      // Main conversion funnel. zero_results_shown is deliberately NOT in
       // this list (see branchRate below) — it's a fork after
       // scan_completed, not a step on the way to signup.
-      // monitoring_activated (added alongside this) is the real finish
-      // line — an account with no product_profiles row never gets
-      // scanned again, so notify_me_completed alone overstates activation.
-      // signup_completed (the separate direct /signup page path, also
-      // newly tracked) isn't folded in here yet — it's a materially
-      // different entry point than the scan-first onboarding flow this
-      // funnel describes, and merging them needs a closer look at how the
-      // two actually relate before changing what this funnel measures.
-      // It still shows up in the "other events" bucket below for now.
+      // monitoring_activated is the real finish line — an account with no
+      // product_profiles row never gets scanned again, so
+      // notify_me_completed alone overstates activation.
+      // signup_completed (the separate direct /signup page path) isn't
+      // folded in here yet — it's a materially different entry point than
+      // the scan-first onboarding flow this funnel describes, and merging
+      // them needs a closer look at how the two actually relate before
+      // changing what this funnel measures. It still shows up in the
+      // "other events" bucket below for now.
       const MAIN_FUNNEL = ['page_view', 'hero_cta_clicked', 'scan_started', 'scan_completed', 'notify_me_completed', 'monitoring_activated']
-      let prevCount = null
-      const funnel = MAIN_FUNNEL.map(step => {
-        const count = uniqueVisitorsFor(step)
-        const dropOffPct = prevCount === null || prevCount === 0 ? 0 : Math.round((1 - count / prevCount) * 1000) / 10
-        prevCount = count
-        return { step, uniqueVisitors: count, dropOffPct }
-      })
+      const funnel = sequentialFunnel(MAIN_FUNNEL)
 
       const scanCompletedCount = uniqueVisitorsFor('scan_completed')
       const zeroResultsCount = uniqueVisitorsFor('zero_results_shown')
@@ -557,15 +740,10 @@ export default async function handler(req, res) {
 
       // Share-link sub-funnel — the /share/[token] page's own flow,
       // separate from the main funnel above (#6 ties view counts to the
-      // same share_page_viewed event, per-token, in watchlist-list).
+      // same share_page_viewed event, per-token, in watchlist-list). Same
+      // sequential-cohort fix applied here.
       const SHARE_FUNNEL = ['share_page_viewed', 'share_notify_opened', 'share_notify_submitted', 'share_notify_completed']
-      let prevShareCount = null
-      const shareFunnel = SHARE_FUNNEL.map(step => {
-        const count = uniqueVisitorsFor(step)
-        const dropOffPct = prevShareCount === null || prevShareCount === 0 ? 0 : Math.round((1 - count / prevShareCount) * 1000) / 10
-        prevShareCount = count
-        return { step, uniqueVisitors: count, dropOffPct }
-      })
+      const shareFunnel = sequentialFunnel(SHARE_FUNNEL)
 
       // Which product URLs most often show zero results — requires
       // zero_results_shown to carry a `url` property (added in
@@ -628,6 +806,32 @@ export default async function handler(req, res) {
         return { visitorId, deviceType: visitorEvents[0]?.deviceType || 'unknown', events: visitorEvents }
       })
 
+      // Compact data-quality indicator — honest about gaps rather than
+      // hiding them. missingSessionId/missingAttribution will be nonzero
+      // for any event logged before Phase 1's schema additions — that's
+      // expected, not a bug, and is exactly the kind of limitation this
+      // is meant to surface rather than silently paper over.
+      const missingSessionId = rows.filter(r => !r.session_id).length
+      const missingDeviceType = rows.filter(r => !r.device_type).length
+      const duplicateGroups = {}
+      rows.forEach(r => {
+        const bucket = Math.floor(new Date(r.created_at).getTime() / 2000) // 2-second buckets
+        const key = `${r.visitor_id}|${r.event_type}|${bucket}`
+        duplicateGroups[key] = (duplicateGroups[key] || 0) + 1
+      })
+      const possibleDuplicates = Object.values(duplicateGroups).filter(c => c > 1).length
+
+      const dataQuality = {
+        totalEvents: rows.length,
+        missingSessionId,
+        missingSessionIdPct: rows.length ? Math.round((missingSessionId / rows.length) * 1000) / 10 : 0,
+        missingDeviceType,
+        possibleDuplicateGroups: possibleDuplicates,
+        note: missingSessionId > 0
+          ? 'Events with no session_id predate the session-tracking schema (Phase 1) — not an error, just unattributable to a session.'
+          : null,
+      }
+
       return res.status(200).json({
         windowHours: hoursBack,
         includeOwner,
@@ -639,6 +843,370 @@ export default async function handler(req, res) {
         deviceBreakdown: deviceCounts,
         otherEvents,
         recentJourneys,
+        dataQuality,
+      })
+    }
+
+    // ─── Visitor explorer (#4) ───────────────────────────────────────────
+    // Status is computed from each visitor's own event history within the
+    // window — never just "clicked signup" counting as converted (the
+    // brief is explicit about this). Pagination operates on the computed
+    // visitor list, not raw events, since status requires each visitor's
+    // full history to determine.
+    if (action === 'get-visitor-list') {
+      const hoursBack = Number(req.body.hoursBack) || 168
+      const includeOwner = !!req.body.includeOwner
+      const search = (req.body.search || '').trim().toLowerCase()
+      // Array or single string — the UI's simplified pill buckets (e.g.
+      // "Converted") map to more than one underlying status value.
+      const statusFilterRaw = req.body.statusFilter
+      const statusFilter = Array.isArray(statusFilterRaw) ? statusFilterRaw : (statusFilterRaw ? [statusFilterRaw] : null)
+      const page = Math.max(1, Number(req.body.page) || 1)
+      const pageSize = Math.min(100, Number(req.body.pageSize) || 25)
+      const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString()
+
+      // session_id was previously missing from this select list — every
+      // visitor's sessionCount computed to 0 regardless of whether real
+      // session data existed, because the column was never fetched, not
+      // because the data was missing. Confirmed by checking log-scan.js's
+      // write path (correct) and get-visitor-profile's query (uses
+      // select('*'), unaffected) before concluding this was the actual
+      // cause rather than guessing.
+      let query = supabaseAdmin
+        .from('visitor_events')
+        .select('visitor_id, event_type, created_at, device_type, is_owner, referrer, utm_source, auth_user_id, landing_page, session_id')
+        .gte('created_at', since)
+        .limit(20000)
+      if (!includeOwner) query = query.eq('is_owner', false)
+      const { data: events, error: eventsErr } = await query
+      if (eventsErr) throw eventsErr
+
+      const byVisitor = {}
+      ;(events || []).forEach(r => {
+        if (!byVisitor[r.visitor_id]) byVisitor[r.visitor_id] = []
+        byVisitor[r.visitor_id].push(r)
+      })
+
+      // Resolve emails for visitors with an associated auth_user_id, in
+      // one batch rather than per-visitor — search-by-email needs this.
+      const authUserIds = [...new Set(Object.values(byVisitor).flat().map(r => r.auth_user_id).filter(Boolean))]
+      let emailByUserId = {}
+      if (authUserIds.length) {
+        const { data: authUsers } = await supabaseAdmin.auth.admin.listUsers({ perPage: 1000 })
+        ;(authUsers?.users || []).forEach(u => { if (authUserIds.includes(u.id)) emailByUserId[u.id] = u.email })
+      }
+
+      const computeStatus = visitorEvents => {
+        const types = new Set(visitorEvents.map(e => e.event_type))
+        const sessionCount = new Set(visitorEvents.map(e => e.session_id).filter(Boolean)).size
+        if (types.has('monitoring_activated')) return 'monitoring_activated'
+        if (types.has('scan_completed') && !types.has('zero_results_shown')) return 'first_scan_completed'
+        if (types.has('zero_results_shown')) return 'zero_result_visitor'
+        if (types.has('notify_me_completed') || types.has('signup_completed')) return 'signup_completed'
+        if (types.has('hero_cta_clicked') || types.has('scan_started')) return 'signup_started'
+        if (sessionCount > 1) return 'returning'
+        if (types.size > 1) return 'engaged'
+        return 'new'
+      }
+
+      const visitors = Object.entries(byVisitor).map(([visitorId, visitorEvents]) => {
+        const sorted = [...visitorEvents].sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+        const authUserId = visitorEvents.find(e => e.auth_user_id)?.auth_user_id || null
+        const lastSeenAt = sorted[sorted.length - 1]?.created_at
+        const isInactive = Date.now() - new Date(lastSeenAt).getTime() > 7 * 24 * 60 * 60 * 1000
+        return {
+          visitorId,
+          email: authUserId ? emailByUserId[authUserId] || null : null,
+          status: isInactive && !['monitoring_activated'].includes(computeStatus(visitorEvents)) ? 'inactive' : computeStatus(visitorEvents),
+          firstVisit: sorted[0]?.created_at,
+          lastVisit: lastSeenAt,
+          sessionCount: new Set(visitorEvents.map(e => e.session_id).filter(Boolean)).size,
+          eventCount: visitorEvents.length,
+          deviceType: sorted[0]?.device_type || 'unknown',
+          referrer: sorted[0]?.referrer || null,
+          utmSource: sorted[0]?.utm_source || null,
+          landingPage: sorted[0]?.landing_page || null,
+        }
+      })
+
+      let filtered = visitors
+      if (statusFilter) filtered = filtered.filter(v => statusFilter.includes(v.status))
+      if (search) filtered = filtered.filter(v => v.visitorId.toLowerCase().includes(search) || (v.email || '').toLowerCase().includes(search))
+      filtered.sort((a, b) => new Date(b.lastVisit) - new Date(a.lastVisit))
+
+      const total = filtered.length
+      const pageStart = (page - 1) * pageSize
+      const pageItems = filtered.slice(pageStart, pageStart + pageSize)
+
+      return res.status(200).json({ visitors: pageItems, total, page, pageSize })
+    }
+
+    // Full timeline for one visitor — human-readable event names, not
+    // just raw event_type strings, and whether each milestone action
+    // succeeded or failed where a confirmed outcome event exists.
+    if (action === 'get-visitor-profile') {
+      const { visitorId } = req.body
+      if (!visitorId) return res.status(400).json({ error: 'visitorId is required' })
+
+      const { data: events, error } = await supabaseAdmin
+        .from('visitor_events')
+        .select('*')
+        .eq('visitor_id', visitorId)
+        .order('created_at', { ascending: true })
+        .limit(2000)
+      if (error) throw error
+      if (!events?.length) return res.status(404).json({ error: 'No events found for this visitor' })
+
+      const EVENT_LABELS = {
+        page_view: 'Viewed a page',
+        hero_cta_clicked: 'Clicked the main call-to-action',
+        scan_started: 'Started a scan',
+        scan_completed: 'Scan completed',
+        scan_failed: 'Scan failed (confirmed error)',
+        zero_results_shown: 'Scan completed with zero qualified leads',
+        zero_result_feedback: 'Gave feedback on a zero-result scan',
+        notify_me_completed: 'Completed the notify-me signup',
+        signup_completed: 'Completed account signup',
+        signup_failed: 'Signup failed (confirmed error)',
+        monitoring_activated: 'Activated ongoing monitoring',
+        share_page_viewed: 'Viewed a shared report',
+        share_notify_opened: 'Opened the share-page signup form',
+        share_notify_submitted: 'Submitted the share-page signup form',
+        share_notify_completed: 'Completed signup from a shared report',
+        save_share_clicked: 'Clicked Save & Share',
+        save_share_completed: 'Share link created',
+      }
+
+      const authUserId = events.find(e => e.auth_user_id)?.auth_user_id || null
+      let email = null
+      if (authUserId) {
+        const { data: authUsers } = await supabaseAdmin.auth.admin.listUsers({ perPage: 1000 })
+        email = authUsers?.users?.find(u => u.id === authUserId)?.email || null
+      }
+
+      const timeline = events.map(e => ({
+        eventType: e.event_type,
+        label: EVENT_LABELS[e.event_type] || e.event_type,
+        timestamp: e.created_at,
+        page: e.path,
+        device: e.device_type,
+        outcome: e.event_type.endsWith('_failed') ? 'failed' : (e.event_source === 'server' ? 'confirmed' : null),
+        properties: e.properties,
+      }))
+
+      return res.status(200).json({
+        visitorId,
+        authUserId,
+        email,
+        firstVisit: events[0].created_at,
+        lastVisit: events[events.length - 1].created_at,
+        sessionCount: new Set(events.map(e => e.session_id).filter(Boolean)).size,
+        deviceType: events[0].device_type,
+        referrer: events[0].referrer,
+        utmSource: events[0].utm_source,
+        landingPage: events[0].landing_page,
+        timeline,
+      })
+    }
+
+    // ─── Abandonment intelligence (#6) ───────────────────────────────────
+    // Last meaningful completed action per visitor, with inactivity
+    // threshold configurable (not hardcoded) and confirmed-error vs
+    // inferred-abandonment kept strictly separate, per the brief.
+    if (action === 'get-abandonment-data') {
+      const hoursBack = Number(req.body.hoursBack) || 168
+      const includeOwner = !!req.body.includeOwner
+      const inactivityThresholdHours = Number(req.body.inactivityThresholdHours) || 48
+      const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString()
+
+      let query = supabaseAdmin
+        .from('visitor_events')
+        .select('visitor_id, event_type, created_at, device_type, referrer, utm_source')
+        .gte('created_at', since)
+        .limit(20000)
+      if (!includeOwner) query = query.eq('is_owner', false)
+      const { data: events, error } = await query
+      if (error) throw error
+
+      const byVisitor = {}
+      ;(events || []).forEach(r => {
+        if (!byVisitor[r.visitor_id]) byVisitor[r.visitor_id] = []
+        byVisitor[r.visitor_id].push(r)
+      })
+
+      // Ordered milestones — a visitor's "last completed action" is the
+      // furthest one reached, regardless of what else fired around it.
+      const MILESTONES = [
+        { key: 'page_view', label: 'Visited homepage but never clicked the CTA' },
+        { key: 'hero_cta_clicked', label: 'Clicked CTA but never reached signup/scan' },
+        { key: 'scan_started', label: 'Started a scan but it never completed' },
+        { key: 'scan_completed', label: 'Completed a scan' },
+        { key: 'zero_results_shown', label: 'Completed a scan with zero qualified leads' },
+        { key: 'notify_me_completed', label: 'Signed up' },
+        { key: 'monitoring_activated', label: 'Activated monitoring but never returned' },
+      ]
+
+      const buckets = {}
+      const nowMs = Date.now()
+      const inactivityMs = inactivityThresholdHours * 60 * 60 * 1000
+
+      Object.entries(byVisitor).forEach(([visitorId, visitorEvents]) => {
+        const types = new Set(visitorEvents.map(e => e.event_type))
+        const lastEventAt = Math.max(...visitorEvents.map(e => new Date(e.created_at).getTime()))
+        const withinThreshold = nowMs - lastEventAt < inactivityMs
+
+        if (withinThreshold) return // still within the observation window — not abandoned yet, per the brief
+
+        let lastMilestone = MILESTONES[0]
+        for (const m of MILESTONES) { if (types.has(m.key)) lastMilestone = m }
+
+        const hasConfirmedError = types.has('scan_failed') || types.has('signup_failed')
+
+        const key = lastMilestone.key
+        if (!buckets[key]) buckets[key] = { label: lastMilestone.label, visitors: [], confirmedErrors: 0, devices: {}, sources: {} }
+        buckets[key].visitors.push(visitorId)
+        if (hasConfirmedError) buckets[key].confirmedErrors++
+        const device = visitorEvents[0]?.device_type || 'unknown'
+        buckets[key].devices[device] = (buckets[key].devices[device] || 0) + 1
+        const source = visitorEvents[0]?.utm_source || (visitorEvents[0]?.referrer ? 'referral' : 'direct')
+        buckets[key].sources[source] = (buckets[key].sources[source] || 0) + 1
+      })
+
+      const totalEligible = Object.values(byVisitor).length
+      const abandonment = Object.entries(buckets).map(([key, b]) => ({
+        milestone: key,
+        label: b.label,
+        affectedVisitors: b.visitors.length,
+        pctOfEligible: totalEligible ? Math.round((b.visitors.length / totalEligible) * 1000) / 10 : 0,
+        confirmedErrors: b.confirmedErrors,
+        inferredAbandonment: b.visitors.length - b.confirmedErrors,
+        deviceBreakdown: b.devices,
+        sourceBreakdown: b.sources,
+        sampleVisitorIds: b.visitors.slice(0, 10),
+      })).sort((a, b) => b.affectedVisitors - a.affectedVisitors)
+
+      return res.status(200).json({ inactivityThresholdHours, totalEligible, abandonment })
+    }
+
+    // ─── Acquisition intelligence (#8) ───────────────────────────────────
+    if (action === 'get-acquisition-data') {
+      const hoursBack = Number(req.body.hoursBack) || 168
+      const includeOwner = !!req.body.includeOwner
+      const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString()
+
+      let query = supabaseAdmin
+        .from('visitor_events')
+        .select('visitor_id, event_type, created_at, referrer, utm_source, session_id')
+        .gte('created_at', since)
+        .limit(20000)
+      if (!includeOwner) query = query.eq('is_owner', false)
+      const { data: events, error } = await query
+      if (error) throw error
+
+      const classifySource = (referrer, utmSource) => {
+        if (utmSource) return utmSource
+        if (!referrer) return 'Direct / Unknown'
+        try {
+          const host = new URL(referrer).hostname.replace(/^www\./, '')
+          if (/twitter\.com|x\.com/.test(host)) return 'X'
+          if (/google\.|bing\.|duckduckgo\./.test(host)) return 'Search'
+          if (host.includes('kairo-omega.vercel.app')) return 'Internal'
+          return host
+        } catch {
+          return 'Direct / Unknown'
+        }
+      }
+
+      const byVisitor = {}
+      ;(events || []).forEach(r => {
+        if (!byVisitor[r.visitor_id]) byVisitor[r.visitor_id] = []
+        byVisitor[r.visitor_id].push(r)
+      })
+
+      const bySource = {}
+      Object.values(byVisitor).forEach(visitorEvents => {
+        const first = [...visitorEvents].sort((a, b) => new Date(a.created_at) - new Date(b.created_at))[0]
+        const source = classifySource(first.referrer, first.utm_source)
+        if (!bySource[source]) bySource[source] = { visitors: new Set(), signups: new Set(), activated: new Set(), sessions: new Set(), returning: new Set() }
+        bySource[source].visitors.add(first.visitor_id)
+        const types = new Set(visitorEvents.map(e => e.event_type))
+        if (types.has('notify_me_completed') || types.has('signup_completed')) bySource[source].signups.add(first.visitor_id)
+        if (types.has('monitoring_activated')) bySource[source].activated.add(first.visitor_id)
+        const sessions = new Set(visitorEvents.map(e => e.session_id).filter(Boolean))
+        sessions.forEach(s => bySource[source].sessions.add(s))
+        if (sessions.size > 1) bySource[source].returning.add(first.visitor_id)
+      })
+
+      const acquisition = Object.entries(bySource).map(([source, d]) => ({
+        source,
+        uniqueVisitors: d.visitors.size,
+        signups: d.signups.size,
+        signupPct: d.visitors.size ? Math.round((d.signups.size / d.visitors.size) * 1000) / 10 : 0,
+        activated: d.activated.size,
+        activationPct: d.visitors.size ? Math.round((d.activated.size / d.visitors.size) * 1000) / 10 : 0,
+        returningVisitors: d.returning.size,
+      })).sort((a, b) => b.uniqueVisitors - a.uniqueVisitors)
+
+      return res.status(200).json({ acquisition })
+    }
+
+    // ─── JSON export (#10) ────────────────────────────────────────────────
+    // Honest limitation: this loads up to 20,000 raw events into memory
+    // and returns them inline in one response — real pagination/streaming
+    // for datasets larger than that doesn't exist yet. truncated: true
+    // signals when the cap was hit, rather than silently dropping records
+    // with no indication.
+    if (action === 'export-analytics-json') {
+      const hoursBack = Number(req.body.hoursBack) || 168
+      const includeOwner = !!req.body.includeOwner
+      const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString()
+      const EXPORT_CAP = 20000
+
+      let query = supabaseAdmin
+        .from('visitor_events')
+        .select('*')
+        .gte('created_at', since)
+        .order('created_at', { ascending: true })
+        .limit(EXPORT_CAP + 1)
+      if (!includeOwner) query = query.eq('is_owner', false)
+      const { data: events, error } = await query
+      if (error) throw error
+
+      const truncated = (events || []).length > EXPORT_CAP
+      const rawEvents = truncated ? events.slice(0, EXPORT_CAP) : (events || [])
+
+      const byVisitor = {}
+      rawEvents.forEach(r => {
+        if (!byVisitor[r.visitor_id]) byVisitor[r.visitor_id] = []
+        byVisitor[r.visitor_id].push(r)
+      })
+      const visitorProfiles = Object.entries(byVisitor).map(([visitorId, visitorEvents]) => {
+        const sorted = [...visitorEvents].sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+        return {
+          visitorId,
+          firstVisit: sorted[0]?.created_at,
+          lastVisit: sorted[sorted.length - 1]?.created_at,
+          eventCount: visitorEvents.length,
+          deviceType: sorted[0]?.device_type,
+          referrer: sorted[0]?.referrer,
+          utmSource: sorted[0]?.utm_source,
+        }
+      })
+
+      return res.status(200).json({
+        exportMetadata: {
+          exportedAt: new Date().toISOString(),
+          timezone: 'UTC',
+          schemaVersion: 1,
+          dateRangeHours: hoursBack,
+          dateRangeSince: since,
+          ownerActivityIncluded: includeOwner,
+          truncated,
+          recordCount: rawEvents.length,
+          truncationNote: truncated ? `Capped at ${EXPORT_CAP} events — narrow the date range for a complete export of a larger window.` : null,
+        },
+        rawEvents,
+        visitorProfiles,
       })
     }
 

@@ -1,11 +1,15 @@
 import { useState, useEffect, createContext, useContext } from 'react'
 import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
-import { track, markOwnerDeviceIfRequested } from '../lib/analytics'
+import { track, markOwnerDeviceIfRequested, setCurrentAccessToken } from '../lib/analytics'
 import '../styles/globals.css'
 
-// Auth context — available to all pages
-export const AuthContext = createContext({ user: null, loading: true })
+// Auth context — available to all pages. session (not just user) is
+// exposed specifically so callers that need to prove who they are to a
+// server-side API — the admin endpoints, most importantly — can send
+// session.access_token rather than a client-claimed email string the
+// server would otherwise have no way to actually verify.
+export const AuthContext = createContext({ user: null, session: null, loading: true })
 export const useAuth = () => useContext(AuthContext)
 
 // Self-hosted analytics (replaces PostHog) — the actual implementation
@@ -16,6 +20,7 @@ export { track }
 
 export default function App({ Component, pageProps }) {
   const [user, setUser] = useState(null)
+  const [session, setSession] = useState(null)
   const [loading, setLoading] = useState(true)
   const router = useRouter()
 
@@ -40,21 +45,25 @@ export default function App({ Component, pageProps }) {
 
   useEffect(() => {
     // Get initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user ?? null)
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      setUser(s?.user ?? null)
+      setSession(s ?? null)
+      setCurrentAccessToken(s?.access_token ?? null)
       setLoading(false)
     })
 
     // Listen for auth changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, s) => {
+      setUser(s?.user ?? null)
+      setSession(s ?? null)
+      setCurrentAccessToken(s?.access_token ?? null)
     })
 
     return () => subscription.unsubscribe()
   }, [])
 
   return (
-    <AuthContext.Provider value={{ user, loading }}>
+    <AuthContext.Provider value={{ user, session, loading }}>
       <Component {...pageProps} />
     </AuthContext.Provider>
   )

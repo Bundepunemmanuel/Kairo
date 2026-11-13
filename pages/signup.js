@@ -43,7 +43,13 @@ export default function Signup() {
       // If email confirmations are OFF in Supabase, signUp returns a session
       // immediately and the user is already logged in — skip straight to onboarding.
       if (data?.session) {
-        track('signup_completed', { method: 'immediate' })
+        // Explicit accessToken here, not the cached one — this fires in
+        // the same tick signUp() resolved, which can beat _app.js's
+        // separate onAuthStateChange listener updating its cache. Passing
+        // it straight from the response data avoids that race, and is
+        // what lets log-scan.js verify this signup server-side instead of
+        // just trusting the claim.
+        track('signup_completed', { method: 'immediate' }, { accessToken: data.session.access_token })
         router.push('/onboarding')
         return
       }
@@ -52,6 +58,7 @@ export default function Signup() {
       // already registered (Supabase's standard way of signalling this
       // without leaking account existence to attackers).
       if (data?.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+        track('signup_failed', { reason: 'email_already_registered' })
         setError('An account with this email already exists. Try signing in instead.')
         setLoading(false)
         return
@@ -60,6 +67,10 @@ export default function Signup() {
       // Otherwise, email confirmation is required — show the "check inbox" screen.
       setSent(true)
     } catch (e) {
+      // Confirmed error — not merely "they stopped" — distinguished from
+      // inferred abandonment by Phase 2's abandonment intelligence. No
+      // password or form contents in the properties, just the error type.
+      track('signup_failed', { reason: e.code || 'unknown', message: (e.message || '').slice(0, 200) })
       setError(e.message || 'Something went wrong. Please try again.')
     } finally {
       setLoading(false)

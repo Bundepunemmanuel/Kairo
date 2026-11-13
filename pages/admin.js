@@ -77,7 +77,7 @@ function buildXReplyUrl(xPostUrl, shareLink, itemId) {
 }
 
 export default function Admin() {
-  const { user, loading: authLoading } = useAuth()
+  const { user, session, loading: authLoading } = useAuth()
   const router = useRouter()
 
   const [plan, setPlan] = useState('free')
@@ -103,6 +103,14 @@ export default function Admin() {
   const [watchlistAdding, setWatchlistAdding] = useState(false)
   const [watchlistAddResult, setWatchlistAddResult] = useState(null) // { inserted, skipped }
   const [watchlistBusy, setWatchlistBusy] = useState(false) // run/stop in flight
+  const [watchlistReplyFilter, setWatchlistReplyFilter] = useState('needs_reply') // needs_reply | replied | all
+
+  // Nurture system
+  const [nurtureData, setNurtureData] = useState(null)
+  const [nurtureProductUrl, setNurtureProductUrl] = useState('')
+  const [nurtureXContact, setNurtureXContact] = useState('')
+  const [nurtureNotes, setNurtureNotes] = useState('')
+  const [nurtureAdding, setNurtureAdding] = useState(false)
 
   // Analytics state and the owner-device toggle now live on their own
   // page — see pages/admin-analytics.js.
@@ -116,6 +124,7 @@ export default function Admin() {
     if (!user || user.email !== ADMIN_EMAIL) return
     loadAdminData()
     loadWatchlist()
+    loadNurture()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user])
 
@@ -134,7 +143,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'get-admin-data', requesterEmail: user.email }),
+        body: JSON.stringify({ action: 'get-admin-data', accessToken: session?.access_token }),
       })
       const rawText = await res.text()
       let data
@@ -169,7 +178,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'force-scan', requesterEmail: user.email }),
+        body: JSON.stringify({ action: 'force-scan', accessToken: session?.access_token }),
       })
       const rawText = await res.text()
       let data
@@ -210,7 +219,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'get-user-leads', requesterEmail: user.email, targetUserId: u.user_id }),
+        body: JSON.stringify({ action: 'get-user-leads', accessToken: session?.access_token, targetUserId: u.user_id }),
       })
       const data = await res.json()
       setUserLeadsById(prev => ({ ...prev, [u.user_id]: data.leads || [] }))
@@ -230,7 +239,7 @@ export default function Admin() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'set-plan',
-          requesterEmail: user.email,
+          accessToken: session?.access_token,
           targetUserId: confirmPlanChange.userId,
           newPlan: confirmPlanChange.newPlan,
         }),
@@ -255,7 +264,7 @@ export default function Admin() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'set-hold',
-          requesterEmail: user.email,
+          accessToken: session?.access_token,
           targetUserId: u.user_id,
           held: !u.is_held,
         }),
@@ -275,7 +284,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'cleanup-old-leads', requesterEmail: user.email }),
+        body: JSON.stringify({ action: 'cleanup-old-leads', accessToken: session?.access_token }),
       })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
@@ -295,7 +304,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'cleanup-seen-posts', requesterEmail: user.email }),
+        body: JSON.stringify({ action: 'cleanup-seen-posts', accessToken: session?.access_token }),
       })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
@@ -314,7 +323,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'watchlist-list', requesterEmail: user.email }),
+        body: JSON.stringify({ action: 'watchlist-list', accessToken: session?.access_token }),
       })
       const data = await res.json()
       if (data.error) { console.log('[admin] watchlist load error:', data.error); return }
@@ -332,7 +341,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'watchlist-add', requesterEmail: user.email, pairs: watchlistPasteText }),
+        body: JSON.stringify({ action: 'watchlist-add', accessToken: session?.access_token, pairs: watchlistPasteText }),
       })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
@@ -352,7 +361,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'watchlist-run', requesterEmail: user.email }),
+        body: JSON.stringify({ action: 'watchlist-run', accessToken: session?.access_token }),
       })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
@@ -370,7 +379,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'watchlist-stop', requesterEmail: user.email }),
+        body: JSON.stringify({ action: 'watchlist-stop', accessToken: session?.access_token }),
       })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
@@ -392,7 +401,7 @@ export default function Admin() {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'watchlist-force-reset', requesterEmail: user.email }),
+        body: JSON.stringify({ action: 'watchlist-force-reset', accessToken: session?.access_token }),
       })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
@@ -404,13 +413,130 @@ export default function Admin() {
     }
   }
 
+  const handleWatchlistMarkReplied = async (id, replied) => {
+    // Optimistic — the click itself is the real signal of intent, no
+    // reason to wait on a round-trip before the UI reflects it.
+    setWatchlistData(prev => prev && {
+      ...prev,
+      items: prev.items.map(it => it.id === id ? { ...it, replied_at: replied ? new Date().toISOString() : null } : it),
+    })
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'watchlist-mark-replied', accessToken: session?.access_token, id, replied }),
+      })
+      const data = await res.json()
+      if (data.error) { console.log('[admin] mark-replied error:', data.error); await loadWatchlist() }
+    } catch (e) {
+      console.log('[admin] mark-replied error:', e.message)
+      await loadWatchlist() // reconcile with the server if the optimistic update was wrong
+    }
+  }
+
+  const loadNurture = async () => {
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'nurture-list', accessToken: session?.access_token }),
+      })
+      const data = await res.json()
+      if (data.error) { console.log('[admin] nurture load error:', data.error); return }
+      setNurtureData(data.items || [])
+    } catch (e) {
+      console.log('[admin] nurture load error:', e.message)
+    }
+  }
+
+  const handleNurtureAdd = async (productUrl, xContact, notes = '') => {
+    if (!productUrl || !xContact) return
+    setNurtureAdding(true)
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'nurture-add', accessToken: session?.access_token, productUrl, xContact, notes }),
+      })
+      const data = await res.json()
+      if (data.error) { alert(data.error); return }
+      setNurtureProductUrl('')
+      setNurtureXContact('')
+      setNurtureNotes('')
+      await loadNurture()
+    } catch (e) {
+      alert('Add failed: ' + e.message)
+    } finally {
+      setNurtureAdding(false)
+    }
+  }
+
+  const handleNurtureMarkSent = async id => {
+    setNurtureData(prev => prev && prev.map(it => it.id === id
+      ? { ...it, times_sent: (it.times_sent || 0) + 1, last_sent_at: new Date().toISOString(), daysSinceLastSent: 0, suggestedAction: null, suggestionKey: 'none' }
+      : it))
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'nurture-mark-sent', accessToken: session?.access_token, id }),
+      })
+      const data = await res.json()
+      if (data.error) { console.log('[admin] mark-sent error:', data.error); await loadNurture() }
+    } catch (e) {
+      console.log('[admin] mark-sent error:', e.message)
+      await loadNurture()
+    }
+  }
+
+  const handleNurtureStatusChange = async (id, status) => {
+    setNurtureData(prev => prev && prev.map(it => it.id === id ? { ...it, status } : it))
+    try {
+      await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'nurture-update-status', accessToken: session?.access_token, id, status }),
+      })
+    } catch (e) {
+      console.log('[admin] status update error:', e.message)
+    }
+  }
+
+  const handleNurtureNotesBlur = async (id, notes) => {
+    try {
+      await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'nurture-update-notes', accessToken: session?.access_token, id, notes }),
+      })
+    } catch (e) {
+      console.log('[admin] notes update error:', e.message)
+    }
+  }
+
+  const handleNurtureDelete = async id => {
+    if (!confirm('Remove this product from the nurture list?')) return
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'nurture-delete', accessToken: session?.access_token, id }),
+      })
+      const data = await res.json()
+      if (data.error) { alert(data.error); return }
+      await loadNurture()
+    } catch (e) {
+      alert('Delete failed: ' + e.message)
+    }
+  }
+
   const handleWatchlistDelete = async (id, productUrl) => {
     if (!confirm(`Remove ${productUrl} from the watchlist?`)) return
     try {
       const res = await fetch('/api/admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'watchlist-delete', requesterEmail: user.email, id }),
+        body: JSON.stringify({ action: 'watchlist-delete', accessToken: session?.access_token, id }),
       })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
@@ -727,12 +853,26 @@ export default function Admin() {
               )}
             </div>
 
+            <div className="admin-pill-row">
+              {[['needs_reply', 'Needs reply'], ['replied', 'Replied'], ['all', 'All']].map(([key, label]) => (
+                <button
+                  key={key}
+                  className={`admin-pill-btn ${watchlistReplyFilter === key ? 'is-active' : ''}`}
+                  onClick={() => setWatchlistReplyFilter(key)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
             {!watchlistData?.items?.length ? (
               <p className="admin-card-empty">Nothing in the watchlist yet.</p>
             ) : (
               <div className="admin-watchlist-list">
-                {watchlistData.items.map(item => (
-                  <div key={item.id} className="admin-watchlist-row">
+                {watchlistData.items
+                  .filter(item => watchlistReplyFilter === 'all' ? true : watchlistReplyFilter === 'replied' ? !!item.replied_at : !item.replied_at)
+                  .map(item => (
+                  <div key={item.id} className={`admin-watchlist-row ${item.replied_at ? 'is-replied' : ''}`}>
                     <div className="admin-watchlist-row-top">
                       <span className={`admin-watchlist-status admin-watchlist-status-${item.status}`}>{item.status}</span>
                       <a href={item.product_url} target="_blank" rel="noreferrer" className="admin-watchlist-link">{item.product_url}</a>
@@ -741,9 +881,19 @@ export default function Admin() {
                           ? buildXReplyUrl(item.x_post_url, `https://kairo-omega.vercel.app/share/${item.share_token}`, item.id)
                           : item.x_post_url}
                         target="_blank" rel="noreferrer" className="admin-watchlist-link admin-watchlist-link-x"
+                        onClick={() => { if (!item.replied_at) handleWatchlistMarkReplied(item.id, true) }}
                       >
-                        Reply ↗
+                        {item.replied_at ? '✓ Replied' : 'Reply ↗'}
                       </a>
+                      {item.replied_at && (
+                        <button
+                          className="admin-watchlist-undo-btn"
+                          onClick={() => handleWatchlistMarkReplied(item.id, false)}
+                          title="Undo — mark as not replied"
+                        >
+                          undo
+                        </button>
+                      )}
                     </div>
                     <div className="admin-watchlist-row-bottom">
                       {item.status === 'done' && item.share_token && (
@@ -754,12 +904,19 @@ export default function Admin() {
                           >
                             📋 Copy share link
                           </button>
+                          <button
+                            className="admin-watchlist-copy-btn"
+                            onClick={() => handleNurtureAdd(item.product_url, item.x_post_url)}
+                          >
+                            🌱 Add to Nurture
+                          </button>
                           <span className="admin-watchlist-meta">{item.lead_count} leads · top score {item.top_score}</span>
                           <span className="admin-watchlist-meta">{item.viewCount} view{item.viewCount === 1 ? '' : 's'}{item.lastViewedAt ? ` · last viewed ${formatRelative(item.lastViewedAt)}` : ''}</span>
                         </>
                       )}
                       {item.status === 'error' && <span className="admin-watchlist-error">{item.error_message}</span>}
                       <span className="admin-watchlist-meta">{formatRelative(item.created_at)}</span>
+                      {item.replied_at && <span className="admin-watchlist-meta">replied {formatRelative(item.replied_at)}</span>}
                       {item.status !== 'scanning' && (
                         <button
                           className="admin-watchlist-delete-btn"
@@ -775,6 +932,107 @@ export default function Admin() {
               </div>
             )}
           </div>
+
+          {/* ─── Nurture system ─────────────────────────────────────────
+              Collapsed by default, same pattern as Churn Risk/Upgrade
+              Requests — a whole second tracking system with its own form
+              and list risked recreating the exact clutter problem the
+              Analytics page redesign above was built to fix. */}
+          <CollapsibleSection
+            title={`🌱 Nurture list${nurtureData?.length ? ` (${nurtureData.filter(n => n.suggestedAction).length} need action)` : ''}`}
+            storageKey="nurture"
+            defaultOpen={false}
+          >
+            <div className="admin-watchlist-add-row" style={{ flexWrap: 'wrap' }}>
+              <input
+                className="admin-search-input"
+                placeholder="Product URL"
+                value={nurtureProductUrl}
+                onChange={e => setNurtureProductUrl(e.target.value)}
+                style={{ flex: 1, minWidth: 160 }}
+              />
+              <input
+                className="admin-search-input"
+                placeholder="X comment/post URL or username"
+                value={nurtureXContact}
+                onChange={e => setNurtureXContact(e.target.value)}
+                style={{ flex: 1, minWidth: 160 }}
+              />
+            </div>
+            <div className="admin-watchlist-add-row">
+              <input
+                className="admin-search-input"
+                placeholder="Notes (optional)"
+                value={nurtureNotes}
+                onChange={e => setNurtureNotes(e.target.value)}
+                style={{ flex: 1 }}
+              />
+              <button
+                className="admin-watchlist-add-btn"
+                disabled={nurtureAdding || !nurtureProductUrl.trim() || !nurtureXContact.trim()}
+                onClick={() => handleNurtureAdd(nurtureProductUrl.trim(), nurtureXContact.trim(), nurtureNotes.trim())}
+              >
+                {nurtureAdding ? 'Adding...' : 'Add'}
+              </button>
+            </div>
+
+            {!nurtureData?.length ? (
+              <p className="admin-card-empty">Nothing in the nurture list yet.</p>
+            ) : (
+              <div className="admin-watchlist-list" style={{ marginTop: 10 }}>
+                {nurtureData.map(item => (
+                  <div key={item.id} className="admin-watchlist-row">
+                    <div className="admin-watchlist-row-top">
+                      <span className={`admin-watchlist-status admin-watchlist-status-${item.status === 'stopped' ? 'error' : item.status === 'cold' ? 'pending' : 'done'}`}>
+                        {item.status}
+                      </span>
+                      <a href={item.product_url} target="_blank" rel="noreferrer" className="admin-watchlist-link">{item.product_url}</a>
+                      {item.suggestedAction && <span className="admin-nurture-suggestion">{item.suggestedAction}</span>}
+                    </div>
+                    <div className="admin-watchlist-row-bottom" style={{ flexWrap: 'wrap' }}>
+                      <span className="admin-watchlist-meta">
+                        {item.x_contact.startsWith('http')
+                          ? <a href={item.x_contact} target="_blank" rel="noreferrer" className="admin-watchlist-link-x">contact ↗</a>
+                          : `@${item.x_contact.replace(/^@/, '')}`}
+                      </span>
+                      <span className="admin-watchlist-meta">sent {item.times_sent}x</span>
+                      <span className="admin-watchlist-meta">
+                        {item.last_sent_at ? `last sent ${item.daysSinceLastSent}d ago` : 'never sent'}
+                      </span>
+                      <select
+                        className="admin-sort-select"
+                        value={item.status}
+                        onChange={e => handleNurtureStatusChange(item.id, e.target.value)}
+                        style={{ fontSize: '0.74rem', padding: '4px 8px' }}
+                      >
+                        <option value="cold">Cold</option>
+                        <option value="warm">Warm</option>
+                        <option value="interested">Interested</option>
+                        <option value="stopped">Stopped</option>
+                      </select>
+                      <button className="admin-watchlist-copy-btn" onClick={() => handleNurtureMarkSent(item.id)}>
+                        ✓ Mark as sent
+                      </button>
+                      <button
+                        className="admin-watchlist-delete-btn"
+                        onClick={() => handleNurtureDelete(item.id)}
+                        title="Remove from nurture list"
+                      >
+                        🗑
+                      </button>
+                    </div>
+                    <input
+                      className="admin-search-input"
+                      placeholder="Notes..."
+                      defaultValue={item.notes || ''}
+                      onBlur={e => handleNurtureNotesBlur(item.id, e.target.value)}
+                      style={{ marginTop: 8, fontSize: '0.78rem' }}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </CollapsibleSection>
 
           {/* Analytics now lives on its own page (/admin-analytics) rather
               than an inline expandable section — opening it used to add

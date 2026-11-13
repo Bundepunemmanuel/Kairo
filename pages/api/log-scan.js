@@ -26,24 +26,121 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
   // ─── Analytics event branch ──────────────────────────────────────────
+  // Events that must be server-confirmed, not merely client-claimed —
+  // the client's own belief that it succeeded isn't proof. For these
+  // specifically, accessToken must resolve to a real Supabase user (and,
+  // for monitoring_activated, that user must actually have a
+  // product_profiles row) or the event is rejected outright rather than
+  // silently accepted as unverified.
+  const SERVER_CONFIRMED_EVENTS = new Set(['signup_completed', 'monitoring_activated'])
+
   if (req.body && req.body.eventType) {
-    const { eventType, visitorId, deviceType, isOwner, path, properties } = req.body
+    const {
+      eventType, visitorId, deviceType, isOwner, path, properties,
+      sessionId, referrer, utmSource, utmMedium, utmCampaign, landingPage,
+      accessToken,
+    } = req.body
     if (!eventType || !visitorId) {
       return res.status(400).json({ error: 'eventType and visitorId are required' })
     }
+
     try {
+      // Resolved server-side from the token, never trusted from a
+      // client-claimed field — this is what makes auth_user_id and the
+      // owner check both non-spoofable. Only attempted when a token is
+      // actually present, so the vast majority of anonymous traffic
+      // (page_view etc.) skips this round-trip entirely.
+      let resolvedUserId = null
+      let serverConfirmedOwner = false
+
+      if (accessToken) {
+        const { data: { user: resolvedUser } } = await supabaseAdmin.auth.getUser(accessToken)
+        if (resolvedUser) {
+          resolvedUserId = resolvedUser.id
+          const { data: ownerRow } = await supabaseAdmin
+            .from('owner_identities')
+            .select('user_id')
+            .eq('user_id', resolvedUser.id)
+            .maybeSingle()
+          serverConfirmedOwner = !!ownerRow
+        }
+      }
+
+      if (SERVER_CONFIRMED_EVENTS.has(eventType) && !resolvedUserId) {
+        // No real, verifiable identity behind this claim — refuse it
+        // rather than recording an unconfirmed "signup" or "monitoring
+        // activated" that never actually happened server-side.
+        console.log(`[log-scan:event] rejected unconfirmed ${eventType} — accessToken missing or did not resolve`)
+        return res.status(401).json({ error: 'Could not verify this event' })
+      }
+
+      if (eventType === 'monitoring_activated' && resolvedUserId) {
+        // Doubly confirmed: a real user AND an actual product_profiles
+        // row for them, read fresh here rather than trusting the
+        // client's "I just upserted it" claim.
+        const { data: profile } = await supabaseAdmin
+          .from('product_profiles')
+          .select('user_id')
+          .eq('user_id', resolvedUserId)
+          .maybeSingle()
+        if (!profile) {
+          console.log('[log-scan:event] rejected monitoring_activated — no product_profiles row found for resolved user')
+          return res.status(409).json({ error: 'No monitoring profile found yet' })
+        }
+      }
+
+      // Owner is true if EITHER signal says so: the server-verified
+      // identity check (strongest, non-spoofable) or the client's
+      // browser-flag fallback (for owner activity while signed out).
+      const finalIsOwner = serverConfirmedOwner || !!isOwner
+
       const { error } = await supabaseAdmin.from('visitor_events').insert({
         event_type: String(eventType).slice(0, 120),
         visitor_id: String(visitorId).slice(0, 200),
         device_type: deviceType ? String(deviceType).slice(0, 20) : null,
-        is_owner: !!isOwner,
+        is_owner: finalIsOwner,
         path: path ? String(path).slice(0, 300) : null,
         properties: properties && typeof properties === 'object' ? properties : {},
+        session_id: sessionId ? String(sessionId).slice(0, 200) : null,
+        referrer: referrer ? String(referrer).slice(0, 500) : null,
+        utm_source: utmSource ? String(utmSource).slice(0, 200) : null,
+        utm_medium: utmMedium ? String(utmMedium).slice(0, 200) : null,
+        utm_campaign: utmCampaign ? String(utmCampaign).slice(0, 200) : null,
+        landing_page: landingPage ? String(landingPage).slice(0, 300) : null,
+        auth_user_id: resolvedUserId,
+        event_source: SERVER_CONFIRMED_EVENTS.has(eventType) ? 'server' : 'client',
       })
       if (error) {
         console.log('[log-scan:event] insert error:', error.message)
         return res.status(500).json({ error: 'Could not log event' })
       }
+
+      // Upserts the session row (first-touch attribution preserved —
+      // only set on insert, never overwritten by a later event in the
+      // same session) so Phase 2's session-level queries don't need to
+      // derive sessions from raw events.
+      if (sessionId) {
+        const { data: existingSession } = await supabaseAdmin
+          .from('visitor_sessions')
+          .select('session_id')
+          .eq('session_id', sessionId)
+          .maybeSingle()
+        if (!existingSession) {
+          await supabaseAdmin.from('visitor_sessions').insert({
+            session_id: String(sessionId).slice(0, 200),
+            visitor_id: String(visitorId).slice(0, 200),
+            device_type: deviceType ? String(deviceType).slice(0, 20) : null,
+            landing_page: landingPage ? String(landingPage).slice(0, 300) : null,
+            referrer: referrer ? String(referrer).slice(0, 500) : null,
+            utm_source: utmSource ? String(utmSource).slice(0, 200) : null,
+            utm_medium: utmMedium ? String(utmMedium).slice(0, 200) : null,
+            utm_campaign: utmCampaign ? String(utmCampaign).slice(0, 200) : null,
+          })
+        } else {
+          await supabaseAdmin.from('visitor_sessions').update({ last_seen_at: new Date().toISOString() }).eq('session_id', sessionId)
+        }
+      }
+
       return res.status(200).json({ ok: true })
     } catch (err) {
       console.error('[log-scan:event] fatal:', err.message)

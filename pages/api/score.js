@@ -7,6 +7,13 @@
 // killed by Vercel mid-wait and return a 504 instead of completing.
 export const config = { maxDuration: 60 }
 
+import { createClient } from '@supabase/supabase-js'
+
+const supabaseAdmin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+)
+
 // ─── Scoring weights ────────────────────────────────────────────────────
 // Final is computed here in code, not by the model, so it can be tuned
 // without touching the prompt. Problem and Intent are weighted higher
@@ -616,9 +623,10 @@ Posts: ${JSON.stringify(input)}`,
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
-  const { posts, analysis, includeCloseMatches } = req.body
+  const { posts, analysis, includeCloseMatches, visitorId, sessionId, deviceType, isOwner, path, referrer, utmSource, utmMedium, utmCampaign, landingPage, accessToken, productUrl } = req.body
   if (!posts?.length || !analysis) return res.status(400).json({ error: 'posts and analysis required' })
 
+  const scanStartedAt = Date.now()
   console.log(`[score] ${posts.length} posts | product: ${analysis.name}`)
 
   try {
@@ -668,6 +676,67 @@ export default async function handler(req, res) {
     }
 
     console.log(`[score] returning ${leads.length} leads`)
+
+    // Only fires for the interactive, visitor-initiated call this
+    // request body shape identifies — onboarding.js's free-scan flow
+    // sends these fields; index.ts's cron-scan and watchlist-scan never
+    // do, so this stays silent for those (scan_completed measures "a
+    // human just scanned their product on the site," not every backend
+    // re-scan of an existing account). Logged HERE, in the same function
+    // that just computed the real result, rather than relying on the
+    // caller's own client JS to remember to call track() after seeing
+    // the response — a thrown exception, a closed tab, or a bug between
+    // receiving this response and that later track() call previously
+    // meant the event could silently never fire even though scoring
+    // genuinely completed.
+    if (visitorId) {
+      try {
+        const qualifiedCount = leads.filter(l => l.tier !== 'close').length
+        const closeMatchCount = leads.filter(l => l.tier === 'close').length
+
+        let resolvedUserId = null
+        let serverConfirmedOwner = false
+        if (accessToken) {
+          const { data: { user: resolvedUser } } = await supabaseAdmin.auth.getUser(accessToken)
+          if (resolvedUser) {
+            resolvedUserId = resolvedUser.id
+            const { data: ownerRow } = await supabaseAdmin
+              .from('owner_identities')
+              .select('user_id')
+              .eq('user_id', resolvedUser.id)
+              .maybeSingle()
+            serverConfirmedOwner = !!ownerRow
+          }
+        }
+
+        await supabaseAdmin.from('visitor_events').insert({
+          event_type: 'scan_completed',
+          visitor_id: String(visitorId).slice(0, 200),
+          device_type: deviceType ? String(deviceType).slice(0, 20) : null,
+          is_owner: serverConfirmedOwner || !!isOwner,
+          path: path ? String(path).slice(0, 300) : null,
+          properties: {
+            leadCount: leads.length, qualifiedCount, closeMatchCount,
+            postsExamined: posts.length,
+            scanDurationMs: Date.now() - scanStartedAt,
+            productUrl: productUrl || null,
+          },
+          session_id: sessionId ? String(sessionId).slice(0, 200) : null,
+          referrer: referrer ? String(referrer).slice(0, 500) : null,
+          utm_source: utmSource ? String(utmSource).slice(0, 200) : null,
+          utm_medium: utmMedium ? String(utmMedium).slice(0, 200) : null,
+          utm_campaign: utmCampaign ? String(utmCampaign).slice(0, 200) : null,
+          landing_page: landingPage ? String(landingPage).slice(0, 300) : null,
+          auth_user_id: resolvedUserId,
+          event_source: 'server',
+        })
+      } catch (trackErr) {
+        // Never let analytics logging affect the actual scan response —
+        // the person waiting for their leads gets them regardless.
+        console.log('[score] scan_completed logging error (non-fatal):', trackErr.message)
+      }
+    }
+
     return res.status(200).json({ leads, scoredUrls })
 
   } catch (err) {

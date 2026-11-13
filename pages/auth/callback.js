@@ -26,7 +26,7 @@ export default function AuthCallback() {
       // profile, and would wrongly count as a new signup otherwise).
       const accountAgeMs = Date.now() - new Date(session.user.created_at).getTime()
       if (accountAgeMs < 15 * 60 * 1000) {
-        track('signup_completed', { method: 'email_confirmation' })
+        track('signup_completed', { method: 'email_confirmation' }, { accessToken: session.access_token })
       }
 
       // Check if user has a saved product profile

@@ -4,6 +4,7 @@ import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { supabase } from '../lib/supabase'
 import { useAuth, track } from './_app'
+import { getTrackingFields } from '../lib/analytics'
 import { pushIsSupported, needsHomeScreenInstructions, subscribeToPush } from '../lib/push'
 import ScoreGauge from '../components/ScoreGauge'
 
@@ -140,7 +141,7 @@ async function fetchSubredditsDualPath(subreddits) {
 // ─── Component ────────────────────────────────────────────────────────────
 
 export default function Onboarding() {
-  const { user, loading: authLoading } = useAuth()
+  const { user, session, loading: authLoading } = useAuth()
   const router = useRouter()
   const [url, setUrl] = useState('')
   const [stage, setStage] = useState('input')
@@ -171,6 +172,10 @@ export default function Onboarding() {
   const [captureExisting, setCaptureExisting] = useState(false)
   const [sessionAccessToken, setSessionAccessToken] = useState(null)
   const [pushOptInStatus, setPushOptInStatus] = useState('idle') // idle | requesting | granted | denied | error
+  const [zeroResultFeedbackReason, setZeroResultFeedbackReason] = useState(null)
+  const [zeroResultFeedbackText, setZeroResultFeedbackText] = useState('')
+  const [zeroResultFeedbackGiven, setZeroResultFeedbackGiven] = useState(false)
+  const [zeroResultFeedbackSkipped, setZeroResultFeedbackSkipped] = useState(false)
   // Set right before we mint a session for a freshly-captured account, so
   // the profile-check effect below doesn't immediately redirect to
   // /dashboard and slam them into the password gate — they should get to
@@ -430,10 +435,20 @@ export default function Onboarding() {
       // (confirmed directly — commentsMap wasn't in its req.body
       // destructuring) and the comments endpoint gets Reddit's explicit
       // anti-bot block page 100% of the time. Pure dead weight, removed.
+      // Tracking fields attached directly to this request — score.js logs
+      // scan_completed itself, server-side, in the same function that
+      // just computed the real result, rather than this client code
+      // calling track() separately afterward (previously: a thrown
+      // exception, a closed tab, or a bug between receiving the response
+      // and that later call could silently drop the event even though
+      // scoring genuinely completed).
       const scoreRes = await fetch('/api/score', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ posts: allPosts, analysis: productAnalysis, includeCloseMatches: true }),
+        body: JSON.stringify({
+          posts: allPosts, analysis: productAnalysis, includeCloseMatches: true, productUrl: clean,
+          ...getTrackingFields({ accessToken: session?.access_token }),
+        }),
       })
 
       const { leads: scoredLeads, error: scoreError } = await scoreRes.json()
@@ -445,12 +460,6 @@ export default function Onboarding() {
       setStage('results')
 
       const qualifiedForFeed = (scoredLeads || []).filter(l => l.tier !== 'close')
-      const closeForFeed = (scoredLeads || []).filter(l => l.tier === 'close')
-      track('scan_completed', {
-        leadCount: (scoredLeads || []).length,
-        qualifiedCount: qualifiedForFeed.length,
-        closeMatchCount: closeForFeed.length,
-      })
       if (qualifiedForFeed.length === 0) track('zero_results_shown', { url: clean })
 
       // Public homepage ticker — every scan that found something, not just
@@ -494,7 +503,7 @@ export default function Onboarding() {
             updated_at: new Date().toISOString(),
           }, { onConflict: 'user_id' })
 
-          if (isFirstActivation) track('monitoring_activated')
+          if (isFirstActivation) track('monitoring_activated', {}, { accessToken: session?.access_token })
 
           // Save leads — qualified tier only. Close matches are shown in
           // the onboarding UI for context but were explicitly scoped to
@@ -527,6 +536,11 @@ export default function Onboarding() {
         }
       }
     } catch (e) {
+      // Confirmed failure, not inferred abandonment — this is what lets
+      // Phase 2's abandonment view say "this person's scan errored" with
+      // actual certainty, instead of just "they stopped after
+      // scan_started" and guessing why.
+      track('scan_failed', { reason: (e.message || 'unknown').slice(0, 200) })
       setError(e.message || 'Something went wrong. Please try again.')
       setStage('input')
     }
@@ -889,8 +903,57 @@ export default function Onboarding() {
                     This is normal — demand for most products comes in waves, not a steady stream. Kairo only surfaces leads where someone is <strong>specifically experiencing a problem you solve</strong>, and right now the recent posts in your subreddits don't meet that bar.
                   </p>
                   <p className="no-leads-body" style={{ marginTop: 8 }}>
-                    Kairo keeps scanning every 15–30 minutes and will notify you the moment something strong appears.
+                    Kairo keeps scanning every hour and will notify you the moment something strong appears.
                   </p>
+
+                  {/* Optional, never forced — a skipped or dismissed
+                      prompt is not itself tracked as a negative signal,
+                      only an actual answer is. */}
+                  {!zeroResultFeedbackGiven && !zeroResultFeedbackSkipped && (
+                    <div className="zero-feedback-box">
+                      <p className="zero-feedback-question">We couldn't find a qualified lead. What were you hoping to find?</p>
+                      <div className="zero-feedback-options">
+                        {['More specific posts about my exact problem', 'More results overall', 'Posts from different subreddits', 'Just curious what Kairo finds over time'].map(opt => (
+                          <button
+                            key={opt}
+                            className="zero-feedback-option-btn"
+                            onClick={() => setZeroResultFeedbackReason(opt)}
+                            style={zeroResultFeedbackReason === opt ? { borderColor: 'var(--rust)', color: 'var(--rust)' } : {}}
+                          >
+                            {opt}
+                          </button>
+                        ))}
+                      </div>
+                      <textarea
+                        className="zero-feedback-freetext"
+                        placeholder="Anything else? (optional)"
+                        value={zeroResultFeedbackText}
+                        onChange={e => setZeroResultFeedbackText(e.target.value)}
+                        rows={2}
+                      />
+                      <div className="zero-feedback-actions">
+                        <button
+                          className="zero-feedback-submit-btn"
+                          disabled={!zeroResultFeedbackReason && !zeroResultFeedbackText.trim()}
+                          onClick={() => {
+                            track('zero_result_feedback', {
+                              url: clean,
+                              reason: zeroResultFeedbackReason || null,
+                              freeText: zeroResultFeedbackText.trim().slice(0, 500) || null,
+                            })
+                            setZeroResultFeedbackGiven(true)
+                          }}
+                        >
+                          Send feedback
+                        </button>
+                        <button className="zero-feedback-skip-btn" onClick={() => setZeroResultFeedbackSkipped(true)}>Skip</button>
+                      </div>
+                    </div>
+                  )}
+                  {zeroResultFeedbackGiven && (
+                    <p className="no-leads-body" style={{ marginTop: 8, color: 'var(--ink-light)', fontSize: '0.82rem' }}>Thanks — that helps.</p>
+                  )}
+
                   <div className="no-leads-actions">
                     {captureDone ? (
                       <div className="email-success">
