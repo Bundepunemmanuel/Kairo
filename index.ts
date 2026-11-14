@@ -166,10 +166,26 @@ async function scorePosts(posts: any[], analysis: any, includeCloseMatches = fal
       signal: AbortSignal.timeout(30000),
     })
     const data = await res.json()
-    return { leads: data.leads || [], scoredUrls: data.scoredUrls || [] }
+
+    // score.js now returns { error: 'scoring_failed', retriable: true }
+    // instead of { leads: [] } when every provider attempt failed or
+    // returned unusable output — distinct from a genuine zero-qualified
+    // result. Surfaced here as `failed` so both callers below (the main
+    // loop and runWatchlistScan) can record a real error instead of
+    // treating this run as "completed, 0 leads."
+    if (data.error === 'scoring_failed') {
+      console.log('[cron-scan] score.js reported scoring_failed — not treating this as a genuine zero-lead result')
+      return { leads: [], scoredUrls: data.scoredUrls || [], failed: true }
+    }
+
+    return { leads: data.leads || [], scoredUrls: data.scoredUrls || [], failed: false }
   } catch (e) {
     console.log('[cron-scan] score error:', e.message)
-    return { leads: [], scoredUrls: [] }
+    // A network error/timeout talking to /api/score is the exact same
+    // "scoring never completed" case as scoring_failed above — it was
+    // just as silently indistinguishable from a real zero-lead result
+    // before this fix. Treated the same way here for both callers below.
+    return { leads: [], scoredUrls: [], failed: true }
   }
 }
 
@@ -656,7 +672,19 @@ async function processWatchlistItem(item: { id: string; product_url: string; x_p
     // Step 3: score — existing /api/score flow, unchanged, with
     // includeCloseMatches so save-share gets the same full leads array
     // onboarding.js's own Save & Share button would produce.
-    const { leads: scoredLeads } = await scorePosts(freshPosts, analysis, true)
+    const { leads: scoredLeads, failed: scoringFailed } = await scorePosts(freshPosts, analysis, true)
+
+    if (scoringFailed) {
+      // Scoring never actually completed — a real, retriable failure,
+      // not "scanned and found nothing." Distinct error_message from the
+      // genuine zero-match case below so whoever reads watchlist_items
+      // (the admin UI, or a retry job) can tell the two apart instead of
+      // this being recorded identically to a real zero-match result.
+      console.log(`[watchlist-scan] item ${id}: scoring failed (every provider attempt failed or returned unusable output)`)
+      await mark({ status: 'error', error_message: 'Scoring failed — every AI provider attempt failed or returned unusable output. Retriable.' })
+      return
+    }
+
     const qualifiedCount = scoredLeads.filter((l: any) => l.tier !== 'close').length
     console.log(`[watchlist-scan] item ${id}: scored ${freshPosts.length} posts → ${scoredLeads.length} leads (${qualifiedCount} qualified, ${scoredLeads.length - qualifiedCount} close)`)
 
@@ -813,6 +841,7 @@ Deno.serve(async (req) => {
     let skippedCount = 0
     let noPostsCount = 0
     let noLeadsCount = 0
+    let scoringFailedCount = 0
     let allSeenCount = 0
     let insertErrorCount = 0
     const debug: any[] = []
@@ -1011,7 +1040,21 @@ Deno.serve(async (req) => {
         continue
       }
 
-      const { leads: scoredLeads, scoredUrls } = await scorePosts(allPosts, analysis)
+      const { leads: scoredLeads, scoredUrls, failed: scoringFailed } = await scorePosts(allPosts, analysis)
+
+      if (scoringFailed) {
+        // Scoring never actually completed for this user this run — a
+        // real error, not "scanned and found nothing." Must not be
+        // recorded as seen_posts (these posts were never genuinely
+        // scored, so they should still be eligible next run) and must
+        // not fall through to the no-qualifying-leads path below, which
+        // would otherwise silently count this the same as a real zero
+        // result.
+        console.log(`[cron-scan] user ${userId}: scoring failed this run — will retry on the next scheduled run`)
+        scoringFailedCount++
+        debug.push({ userId, reason: 'scoring_failed', postsScanned: allPosts.length })
+        continue
+      }
 
       // Record every post actually sent to scoring as seen — whether it
       // qualified as a lead or not — so it's never re-scored again.
@@ -1124,6 +1167,7 @@ Deno.serve(async (req) => {
         remainingThisHour: remainingAfterThisBatch,
         noPostsFetched: noPostsCount,
         noQualifyingLeads: noLeadsCount,
+        scoringFailed: scoringFailedCount,
         allLeadsAlreadySeen: allSeenCount,
         insertErrors: insertErrorCount,
         debug,
