@@ -4,7 +4,9 @@ import Head from 'next/head'
 import { supabase } from '../../lib/supabase'
 import { pushIsSupported, needsHomeScreenInstructions, subscribeToPush } from '../../lib/push'
 import { getShareByToken } from '../../lib/getShareData'
+import { isInAppBrowser, inAppBrowserName } from '../../lib/inAppBrowser'
 import ScoreGauge from '../../components/ScoreGauge'
+import OpenInBrowserPrompt from '../../components/OpenInBrowserPrompt'
 import { track } from '../_app'
 
 // ─── Reddit parsing — duplicated from onboarding.js rather than shared,
@@ -122,6 +124,22 @@ const isInsideWindow = lead => {
   return (Date.now() - lead.createdAt) / 60000 < windowMinutes(lead)
 }
 
+// Previously "leads go cold in 24 hours" only existed in the og:description
+// meta tag — invisible to anyone who'd actually clicked through and was
+// reading the page itself. This renders the same urgency as a live,
+// visible badge on each lead card that's still inside its window, ticking
+// down in real time rather than frozen at page-load (see the nowTick
+// state in the component below forcing a re-render every 30s).
+function formatTimeLeft(lead) {
+  if (!lead.createdAt) return null
+  const minutesLeft = windowMinutes() - (Date.now() - lead.createdAt) / 60000
+  if (minutesLeft <= 0) return null
+  const hours = Math.floor(minutesLeft / 60)
+  const mins = Math.round(minutesLeft % 60)
+  if (hours >= 1) return `${hours}h ${mins}m left`
+  return `${Math.max(mins, 1)}m left`
+}
+
 // SSR, not client fetch — the only page in this app that needs it. Link
 // preview bots (Slack, Twitter, iMessage) read only the first server
 // response and don't wait for or execute client-side fetches, so the
@@ -141,10 +159,26 @@ export default function SharePage({ token, initialStatus, initialData }) {
   const [notifyEmail, setNotifyEmail] = useState('')
   const [notifyOpen, setNotifyOpen] = useState(false)
   const [notifyStage, setNotifyStage] = useState('form') // form | scanning | done
+  const [notifyStep, setNotifyStep] = useState('email') // email | url — two sequential steps instead of one combined form
   const [notifyError, setNotifyError] = useState('')
   const [notifyExisting, setNotifyExisting] = useState(false)
   const [sessionAccessToken, setSessionAccessToken] = useState(null)
   const [pushOptInStatus, setPushOptInStatus] = useState('idle') // idle | requesting | granted | denied | error
+
+  // Computed client-side only (navigator isn't available during SSR) —
+  // false on first paint, then set once mounted. Gates the notify-me
+  // form entirely: confirmed broken inside X's in-app browser.
+  const [inAppBrowser, setInAppBrowser] = useState(false)
+  useEffect(() => { setInAppBrowser(isInAppBrowser()) }, [])
+
+  // Forces a re-render every 30s so the per-lead "X left" badges (see
+  // formatTimeLeft above) actually count down live instead of freezing
+  // at whatever time the page happened to load.
+  const [, forceTick] = useState(0)
+  useEffect(() => {
+    const t = setInterval(() => forceTick(v => v + 1), 30000)
+    return () => clearInterval(t)
+  }, [])
 
   // ── Shared Reddit quota countdown — see onboarding.js for full reasoning ──
   const [quotaResetAt, setQuotaResetAt] = useState(null)
@@ -198,6 +232,20 @@ export default function SharePage({ token, initialStatus, initialData }) {
     setTimeout(() => setCopiedId(null), 2000)
   }
 
+  // Step 1 of 2 — email only. Previously this and the product URL were
+  // asked for in one combined form at once; splitting into two smaller,
+  // sequential commitments (email first, URL second) instead.
+  const handleEmailStepContinue = () => {
+    setNotifyError('')
+    const trimmedEmail = notifyEmail.trim()
+    if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+      setNotifyError('Please enter a valid email')
+      return
+    }
+    setNotifyStep('url')
+  }
+
+  // Step 2 of 2 — product URL, then runs the actual scan + notify flow.
   const handleNotifySubmit = async () => {
     setNotifyError('')
     if (quotaSecondsLeft > 0) {
@@ -248,6 +296,9 @@ export default function SharePage({ token, initialStatus, initialData }) {
           body: JSON.stringify({ posts: allPosts, analysis: productAnalysis, includeCloseMatches: true }),
         })
         const scoreData = await scoreRes.json()
+        if (scoreData.error === 'scoring_failed') {
+          throw new Error('Something went wrong while scoring your leads. Please try again.')
+        }
         if (scoreData.error) throw new Error(scoreData.error)
         scoredLeads = scoreData.leads || []
       }
@@ -459,6 +510,11 @@ export default function SharePage({ token, initialStatus, initialData }) {
                     </span>
                     <span className="lead-subreddit">r/{lead.subreddit}</span>
                     <ScoreGauge score={lead.score} />
+                    {formatTimeLeft(lead) && (
+                      <span className="signal-badge-card" style={{ background: 'rgba(192,88,74,0.1)', color: 'var(--rust)' }}>
+                        ⏳ {formatTimeLeft(lead)}
+                      </span>
+                    )}
                   </div>
                 </div>
 
@@ -511,6 +567,11 @@ export default function SharePage({ token, initialStatus, initialData }) {
                       <span className="close-match-badge">Close match</span>
                       <span className="lead-subreddit">r/{lead.subreddit}</span>
                       <ScoreGauge score={lead.score} />
+                      {formatTimeLeft(lead) && (
+                        <span className="signal-badge-card" style={{ background: 'rgba(192,88,74,0.1)', color: 'var(--rust)' }}>
+                          ⏳ {formatTimeLeft(lead)}
+                        </span>
+                      )}
                     </div>
                     <h4 className="close-match-title">{lead.title}</h4>
                     {lead.body && (
@@ -581,35 +642,51 @@ export default function SharePage({ token, initialStatus, initialData }) {
                       )}
                     </div>
                   </div>
+                ) : inAppBrowser ? (
+                  // Confirmed broken: this form doesn't work inside X's
+                  // own in-app browser (and Google's own OAuth policy
+                  // separately blocks sign-in from these same browsers —
+                  // see lib/inAppBrowser.js). Shown in place of the form
+                  // entirely rather than letting it fail silently.
+                  <OpenInBrowserPrompt appName={inAppBrowserName()} label="this form" />
                 ) : notifyOpen ? (
                   <>
                     {notifyStage === 'scanning' ? (
                       <p className="email-gate-note" style={{ fontStyle: 'italic' }}>Scanning your product and setting up notifications...</p>
+                    ) : notifyStep === 'email' ? (
+                      // Step 1 of 2 — email only. Was one combined
+                      // email+URL form; splitting into two smaller,
+                      // sequential commitments instead.
+                      <div className="email-gate-row">
+                        <input
+                          type="email"
+                          className="email-input"
+                          placeholder="you@example.com"
+                          value={notifyEmail}
+                          onChange={e => { setNotifyEmail(e.target.value); setNotifyError('') }}
+                          onKeyDown={e => e.key === 'Enter' && handleEmailStepContinue()}
+                          autoFocus
+                        />
+                        <button className="email-submit" onClick={handleEmailStepContinue}>
+                          Continue →
+                        </button>
+                      </div>
                     ) : (
-                      <>
-                        <div className="email-gate-row" style={{ marginBottom: 8 }}>
-                          <input
-                            type="text"
-                            className="email-input"
-                            placeholder="yourproduct.com"
-                            value={notifyUrl}
-                            onChange={e => { setNotifyUrl(e.target.value); setNotifyError('') }}
-                          />
-                        </div>
-                        <div className="email-gate-row">
-                          <input
-                            type="email"
-                            className="email-input"
-                            placeholder="you@example.com"
-                            value={notifyEmail}
-                            onChange={e => { setNotifyEmail(e.target.value); setNotifyError('') }}
-                            onKeyDown={e => e.key === 'Enter' && handleNotifySubmit()}
-                          />
-                          <button className="email-submit" onClick={handleNotifySubmit} disabled={quotaSecondsLeft > 0}>
-                            {quotaSecondsLeft > 0 ? `Available in ${quotaSecondsLeft}s` : 'Notify me'}
-                          </button>
-                        </div>
-                      </>
+                      // Step 2 of 2 — product URL, then runs the scan.
+                      <div className="email-gate-row">
+                        <input
+                          type="text"
+                          className="email-input"
+                          placeholder="yourproduct.com"
+                          value={notifyUrl}
+                          onChange={e => { setNotifyUrl(e.target.value); setNotifyError('') }}
+                          onKeyDown={e => e.key === 'Enter' && handleNotifySubmit()}
+                          autoFocus
+                        />
+                        <button className="email-submit" onClick={handleNotifySubmit} disabled={quotaSecondsLeft > 0}>
+                          {quotaSecondsLeft > 0 ? `Available in ${quotaSecondsLeft}s` : 'Notify me'}
+                        </button>
+                      </div>
                     )}
                     {quotaSecondsLeft > 0 && !notifyError && (
                       <p className="ob-error" style={{ color: 'var(--ink-light)' }}>
@@ -622,7 +699,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
                   <button
                     className="ob-scan-btn"
                     style={{ width: '100%', textAlign: 'center' }}
-                    onClick={() => { setNotifyOpen(true); track('share_notify_opened') }}
+                    onClick={() => { setNotifyOpen(true); setNotifyStep('email'); track('share_notify_opened') }}
                   >
                     Scan my product free →
                   </button>

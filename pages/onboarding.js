@@ -453,6 +453,16 @@ export default function Onboarding() {
 
       const { leads: scoredLeads, error: scoreError } = await scoreRes.json()
 
+      // scoring_failed means scoring never actually completed (every AI
+      // provider attempt failed or returned unusable output) — distinct
+      // from a genuine zero-qualified-leads result. Throwing here routes
+      // to the catch block below, which sets stage('input') with an
+      // error message — never stage('results'), so neither the
+      // zero-results screen nor its feedback prompt (both reserved for an
+      // actual zero) ever show for this case.
+      if (scoreError === 'scoring_failed') {
+        throw new Error('Something went wrong while scoring your leads. Please try again.')
+      }
       if (scoreError) throw new Error(scoreError)
 
       localStorage.setItem('kairo_scan_used', '1')

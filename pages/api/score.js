@@ -40,6 +40,19 @@ const QUALIFY_THRESHOLD = 60
 // tier is inert there — zero behavior change for existing users.
 const CLOSE_MATCH_THRESHOLD = 40
 
+// Groq-specific input cap — confirmed in production logs: a pass-1
+// relevance call sent ~200 posts to Groq as a fallback and got rejected
+// outright ("Request too large... Limit 8000, Requested 12179" — a
+// context-size limit, not the maxTokens output budget above). Gemini and
+// gpt-oss-20b never hit this in practice, so only Groq's own input is
+// capped here — the other providers in the same race still see the full
+// sample. A capped Groq just scores/rates fewer posts if it's the one
+// that ends up winning the race; posts outside its slice fail open in
+// relevanceFilter (treated as relevant) or simply don't appear in pass
+// 2's result, same as if Groq had returned fewer rows for any other
+// reason. Never changes what Gemini/gpt-oss-20b are sent.
+const GROQ_BATCH_CAP = 40
+
 function parseRetryAfterSeconds(message) {
   // Groq's TPM error looks like: "...Please try again in 30.1725s."
   const match = (message || '').match(/try again in ([\d.]+)s/i)
@@ -296,6 +309,26 @@ function salvageTruncatedArray(clean) {
   }
 }
 
+// Confirmed in production: Groq won a provider race but its content
+// parsed into a full array where EVERY post scored problem:0, icp:0,
+// intent:0, why:"" — not a parse failure (the JSON was well-formed), but
+// not a real scoring result either. A genuine zero-leads result has a mix
+// of scores across posts (some higher, most below threshold); a uniform
+// all-zero/empty-why wall across every single post in the batch is the
+// signature of a model that returned a stub/placeholder shape instead of
+// actually scoring anything. Only flags it when there's more than one
+// post AND every one is zeroed — a single genuinely-bad post scoring 0
+// across the board is normal and not this pattern.
+function isDegenerateScoring(parsed) {
+  if (!Array.isArray(parsed) || parsed.length < 2) return false
+  return parsed.every(s =>
+    (Number(s.problem) || 0) === 0 &&
+    (Number(s.icp) || 0) === 0 &&
+    (Number(s.intent) || 0) === 0 &&
+    !String(s.why || '').trim()
+  )
+}
+
 // ─── Score all posts, two passes ───────────────────────────────────────
 // Takes up to 250 posts, returns { scored: [...], closeMatches: [...], scoredUrls: [...] }.
 // Pass 1 (relevanceFilter, above) is a cheap loose screen over the full
@@ -379,9 +412,15 @@ Posts: ${JSON.stringify(input)}`,
     // the other — same reasoning as pass 2 below, applied here too since
     // this fallback chain has the identical sequential-timeout risk.
     console.log('[score:pass1] Gemini empty — racing gpt-oss-20b and Groq')
+    // Groq gets a capped slice of this same batch (see GROQ_BATCH_CAP) —
+    // this is the exact call that rejected a ~200-post batch outright in
+    // production. gpt-oss-20b still gets the full, uncapped batch.
+    const groqMessages = input.length > GROQ_BATCH_CAP
+      ? [messages[0], { ...messages[1], content: messages[1].content.replace(JSON.stringify(input), JSON.stringify(input.slice(0, GROQ_BATCH_CAP))) }]
+      : messages
     raw = await raceForContent([
       { label: 'gpt-oss-20b', promise: gptOss20b(messages, 3000, 0.1) },
-      { label: 'groq', promise: groq(messages, 2000, 0.1) },
+      { label: 'groq', promise: groq(groqMessages, 2000, 0.1) },
     ])
   }
 
@@ -430,18 +469,22 @@ Posts: ${JSON.stringify(input)}`,
   return survivors
 }
 
-async function scorePosts(posts, analysis) {
-  // Capped at 250 (was 60) — matches reddit.js's requested limit, even
-  // though in practice Reddit's own 100-post ceiling means this rarely
-  // slices anything off (a single request currently returns ~100 at
-  // most). Every post in this full sample is what scoredUrls (below)
-  // marks as "sent to an AI for scoring" in cron-scan's seen_posts dedup —
-  // pass 1 genuinely did score all of them, even the ones that don't make
-  // it to pass 2.
-  const fullSample = interleaveBySubreddit(posts).slice(0, 250)
+// sampleCap: how many posts (after round-robin interleaving) enter pass 1
+// at all. 250 on the normal attempt (was 60) — matches reddit.js's
+// requested limit, even though in practice Reddit's own 100-post ceiling
+// means this rarely slices anything off (a single request currently
+// returns ~100 at most). scorePosts (below) calls this a second time with
+// a smaller cap (~80) if the full-size attempt fails outright, since a
+// smaller batch is less likely to hit the same provider-side limits.
+async function scorePostsAttempt(posts, analysis, sampleCap) {
+  // Every post in this full sample is what scoredUrls (below) marks as
+  // "sent to an AI for scoring" in cron-scan's seen_posts dedup — pass 1
+  // genuinely did score all of them, even the ones that don't make it to
+  // pass 2.
+  const fullSample = interleaveBySubreddit(posts).slice(0, sampleCap)
   const scoredUrls = fullSample.map(p => p.url).filter(Boolean)
 
-  if (!fullSample.length) return { scored: [], closeMatches: [], scoredUrls }
+  if (!fullSample.length) return { scored: [], closeMatches: [], scoredUrls, failed: false }
 
   // ─── Pass 1 — cheap relevance screen over the full up-to-100 sample ───
   const relevant = await relevanceFilter(fullSample, analysis)
@@ -453,7 +496,7 @@ async function scorePosts(posts, analysis) {
     // scoredUrls still covers the full pass-1 sample above, so these
     // posts are correctly marked seen either way.
     console.log('[score] 0 posts survived pass 1 — skipping pass 2 (nothing to score)')
-    return { scored: [], closeMatches: [], scoredUrls }
+    return { scored: [], closeMatches: [], scoredUrls, failed: false }
   }
 
   // ─── Pass 2 — existing full scoring prompt, completely unchanged below,
@@ -548,16 +591,45 @@ Posts: ${JSON.stringify(input)}`,
 
   if (!raw) {
     console.log('[score] Gemini empty — racing gpt-oss-20b and Groq')
+    // Same Groq-specific cap as pass 1 (GROQ_BATCH_CAP) — this sample is
+    // already capped to 60 above, so this rarely slices anything off in
+    // practice, but it's the same fallback call that rejected an
+    // oversized batch in production and there's no reason to leave it
+    // unguarded here.
+    const groqMessages = input.length > GROQ_BATCH_CAP
+      ? [messages[0], { ...messages[1], content: messages[1].content.replace(JSON.stringify(input), JSON.stringify(input.slice(0, GROQ_BATCH_CAP))) }]
+      : messages
     raw = await raceForContent([
       { label: 'gpt-oss-20b', promise: gptOss20b(messages, 6000, 0.1) },
-      { label: 'groq', promise: groq(messages, 6000, 0.1) },
+      { label: 'groq', promise: groq(groqMessages, 6000, 0.1) },
     ])
   }
 
   console.log(`[score] raw (150): ${raw.slice(0, 150)}`)
 
+  if (!raw) {
+    // Every provider came back empty — not a real zero-result, a failed
+    // attempt. Signaled up through `failed` so the caller (scorePosts,
+    // below) can retry with a smaller batch instead of this silently
+    // becoming "0 qualified leads."
+    console.log('[score] every provider returned empty')
+    return { scored: [], closeMatches: [], scoredUrls, failed: true }
+  }
+
   const scored = parseJSON(raw)
-  if (!scored) { console.log('[score] parse failed'); return { scored: [], closeMatches: [], scoredUrls } }
+  if (!scored) {
+    console.log('[score] parse failed')
+    return { scored: [], closeMatches: [], scoredUrls, failed: true }
+  }
+
+  if (isDegenerateScoring(scored)) {
+    // Parsed fine, but every post came back problem:0/icp:0/intent:0/
+    // why:"" — confirmed in production as a degenerate stub response, not
+    // a genuine "nothing qualifies" result. Treated the same as a parse
+    // failure rather than allowed to flow through as real zero-score data.
+    console.log(`[score] parsed ${scored.length} posts but every one is a degenerate zero/empty — treating as a failed attempt, not a real result`)
+    return { scored: [], closeMatches: [], scoredUrls, failed: true }
+  }
 
   console.log(`[score] model returned ${scored.length} posts scored`)
 
@@ -616,7 +688,33 @@ Posts: ${JSON.stringify(input)}`,
   // inert for paying users' dashboards, unchanged from before.
   const closeMatches = allResults.filter(r => r.tier === 'close')
 
-  return { scored: results, closeMatches, scoredUrls }
+  return { scored: results, closeMatches, scoredUrls, failed: false }
+}
+
+// Public entry point. Runs one full attempt at sampleCap 250; if that
+// attempt failed outright (every provider empty, unparseable, or the
+// degenerate-zero pattern above — never "genuinely found nothing," which
+// returns failed:false), retries once with a smaller ~80-post batch
+// before giving up. A smaller batch means a smaller prompt for every
+// provider in the chain, including Groq's own GROQ_BATCH_CAP slice of
+// it — the whole point is giving the retry a better shot than whatever
+// made the full-size attempt fail, not just trying the exact same thing
+// twice. Whichever attempt's result is returned, scoredUrls from BOTH
+// attempts are unioned so cron-scan's seen_posts dedup still covers every
+// post actually sent to an AI, not just the ones in the winning attempt.
+async function scorePosts(posts, analysis) {
+  const first = await scorePostsAttempt(posts, analysis, 250)
+  if (!first.failed) return first
+
+  console.log('[score] full attempt failed (every provider empty/unparseable/degenerate) — retrying once with a smaller (~80 post) batch')
+  const retry = await scorePostsAttempt(posts, analysis, 80)
+
+  return {
+    scored: retry.scored,
+    closeMatches: retry.closeMatches,
+    scoredUrls: Array.from(new Set([...first.scoredUrls, ...retry.scoredUrls])),
+    failed: retry.failed,
+  }
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────
@@ -630,7 +728,20 @@ export default async function handler(req, res) {
   console.log(`[score] ${posts.length} posts | product: ${analysis.name}`)
 
   try {
-    const { scored, closeMatches, scoredUrls } = await scorePosts(posts, analysis)
+    const { scored, closeMatches, scoredUrls, failed } = await scorePosts(posts, analysis)
+
+    if (failed) {
+      // Every provider attempt (full batch, then the smaller retry) came
+      // back empty, unparseable, or degenerate — scoring never actually
+      // completed. Distinct from a genuine zero-qualified result so
+      // callers (onboarding.js, index.ts) can show/record a real error
+      // instead of "0 leads found." No scan_completed analytics fire
+      // below for this case, intentionally — this request never produced
+      // a real scan result to log one for.
+      console.log('[score] scoring_failed — returning explicit error instead of empty leads')
+      return res.status(200).json({ error: 'scoring_failed', retriable: true, scoredUrls })
+    }
+
     console.log(`[score] qualified: ${scored.length}${includeCloseMatches ? ` | close matches: ${closeMatches.length}` : ''}`)
 
     if (!scored.length && !(includeCloseMatches && closeMatches.length)) {

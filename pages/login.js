@@ -11,6 +11,23 @@ export default function Login() {
   const [showPassword, setShowPassword] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [googleLoading, setGoogleLoading] = useState(false)
+
+  const handleGoogleSignIn = async () => {
+    setError('')
+    setGoogleLoading(true)
+    const { error: err } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: `${window.location.origin}/auth/callback` },
+    })
+    // On success Supabase redirects the browser away immediately, so
+    // there's nothing further to do here. We only ever reach this line
+    // if the redirect itself failed to kick off.
+    if (err) {
+      setError(err.message || 'Something went wrong. Please try again.')
+      setGoogleLoading(false)
+    }
+  }
 
   const handleSubmit = async () => {
     if (!email.trim() || !email.includes('@')) {
@@ -65,6 +82,27 @@ export default function Login() {
             </div>
 
             <div className="auth-form">
+              {/* TEMP: not gating this behind inAppBrowser for now — we
+                  want to see what Google's OAuth flow actually does
+                  inside X's browser (its own block page vs. a working
+                  redirect) before deciding whether to hide the button
+                  here too. */}
+              <button
+                type="button"
+                className="auth-btn"
+                style={{ background: '#fff', color: 'var(--ink)', border: '1px solid rgba(0,0,0,0.15)' }}
+                onClick={handleGoogleSignIn}
+                disabled={googleLoading}
+              >
+                {googleLoading ? 'Redirecting...' : 'Continue with Google'}
+              </button>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0' }}>
+                <div style={{ flex: 1, height: 1, background: 'rgba(0,0,0,0.1)' }} />
+                <span style={{ fontSize: '0.78rem', color: 'var(--ink-light)' }}>or</span>
+                <div style={{ flex: 1, height: 1, background: 'rgba(0,0,0,0.1)' }} />
+              </div>
+
               <div className="auth-field">
                 <label className="auth-label">Email address</label>
                 <input
