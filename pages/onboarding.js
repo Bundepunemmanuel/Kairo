@@ -188,6 +188,26 @@ export default function Onboarding() {
   const [shareError, setShareError] = useState('')
   const [shareCopied, setShareCopied] = useState(false)
 
+  // Prefills the URL field from whatever signup.js stashed (see that file
+  // for why it's localStorage, not just a query param carried over) —
+  // also checks a direct ?url= on this page itself, for robustness. Still
+  // just a plain, editable default: nothing is submitted until the
+  // person themselves proceeds with it, and the stashed value is cleared
+  // right after so it doesn't resurface on some unrelated future visit.
+  useEffect(() => {
+    if (url) return
+    const fromQuery = typeof router.query.url === 'string' ? router.query.url : null
+    let pending = fromQuery
+    if (!pending) {
+      try { pending = localStorage.getItem('kairo_pending_url') } catch {}
+    }
+    if (pending) {
+      setUrl(pending)
+      try { localStorage.removeItem('kairo_pending_url') } catch {}
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router.query.url])
+
   // If a logged-in user already has a saved product profile, send them straight
   // to the dashboard instead of showing the anonymous-visitor marketing funnel.
   // A logged-in user with NO saved profile yet still sees onboarding normally —

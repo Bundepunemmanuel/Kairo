@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import Head from 'next/head'
 import { useRouter } from 'next/router'
@@ -15,6 +15,23 @@ export default function Signup() {
   const [sent, setSent] = useState(false)
   const [error, setError] = useState('')
   const [googleLoading, setGoogleLoading] = useState(false)
+
+  // Carries a product URL forward from wherever someone clicked through
+  // from (e.g. the share page's "sign up" CTA) into onboarding.js's URL
+  // field as a plain, editable prefill. A query param alone can't survive
+  // what happens next: either an immediate session (fine, a param would
+  // work) or an email-confirmation link clicked in a different tab, days
+  // later, or a Google OAuth redirect Supabase controls — neither of
+  // which preserves a query string. localStorage does. Nothing is bound
+  // or submitted here — onboarding.js just prefills the field and clears
+  // this immediately after reading it.
+  useEffect(() => {
+    if (!router.isReady) return
+    const incoming = typeof router.query.url === 'string' ? router.query.url : null
+    if (incoming) {
+      try { localStorage.setItem('kairo_pending_url', incoming) } catch {}
+    }
+  }, [router.isReady, router.query.url])
 
   const handleGoogleSignIn = async () => {
     setError('')
@@ -216,7 +233,7 @@ export default function Signup() {
                 </button>
 
                 <p className="auth-terms">
-                  By signing up you agree to our terms of service.
+                  By signing up you agree to our <Link href="/terms">Terms of Service</Link> and <Link href="/privacy">Privacy Policy</Link>.
                 </p>
               </div>
 
