@@ -50,12 +50,16 @@ function CollapsibleSection({ title, storageKey, defaultOpen = false, children }
 // read as the same copy-pasted line. Deliberately lowercase and short —
 // this is a reply on X, not a product pitch.
 const X_REPLY_OPENERS = [
-  'found a few people asking for exactly this on reddit —',
-  'turned up some live threads for this —',
-  'reddit\u2019s got people asking for this right now —',
-  'found real demand for this on reddit —',
-  'people are asking for this on reddit rn —',
-  'a few reddit threads matched this exactly —',
+  'scanned it, got a match. person\u2019s literally asking for this exact thing',
+  'one of kairo\u2019s scans caught this \u2014 someone dealing with the exact problem',
+  'kairo pulled this up for yours, worth a look imo',
+  'ppl on reddit are asking for basically this, not even joking',
+  'this matched on the first scan. kairo\u2019s built for exactly this kind of post',
+  'scanned reddit for this, one match stood out hard',
+  'not a pitch, just what kairo found scanning for this',
+  'someone\u2019s describing this problem almost word for word, found it running kairo',
+  'ran a scan on this, it matched. worth replying to the post itself tbh',
+  'this is the exact post kairo exists to catch',
 ]
 
 function pickXReplyOpener(itemId) {

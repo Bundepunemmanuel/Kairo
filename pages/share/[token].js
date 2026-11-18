@@ -32,6 +32,16 @@ function formatTimeLeft(lead) {
   return `${Math.max(mins, 1)}m left`
 }
 
+// Plain "posted Nh ago" — states a fact about the post's age rather than
+// commanding the reader to act on it. Used next to the unlock link below
+// instead of a countdown-with-imperative ("unlock before it's gone").
+function hoursAgo(lead) {
+  if (!lead.createdAt) return null
+  const hours = Math.floor((Date.now() - lead.createdAt) / 60000 / 60)
+  if (hours < 1) return 'less than an hour ago'
+  return `${hours}h ago`
+}
+
 // Renders nothing once a lead's window has fully elapsed (formatTimeLeft
 // returns null) — same as the plain badge before it. The fill width
 // recomputes on every parent re-render, which happens every 30s via the
@@ -52,6 +62,21 @@ function UrgencyBar({ lead }) {
   )
 }
 
+// Splits a drafted reply into its first sentence (shown free, as a
+// teaser proving the reply is real and specific) and the remainder
+// (blurred, gated behind signup — see the draft-box rendering below).
+// Falls back to treating the whole thing as the teaser with nothing left
+// to gate if no sentence boundary is found, rather than hiding
+// everything.
+function splitFirstSentence(text) {
+  if (!text) return { first: '', rest: '' }
+  const match = text.match(/^.*?[.!?](?:\s|$)/)
+  if (!match) return { first: text, rest: '' }
+  const first = match[0].trim()
+  const rest = text.slice(match[0].length).trim()
+  return { first, rest }
+}
+
 // SSR, not client fetch — the only page in this app that needs it. Link
 // preview bots (Slack, Twitter, iMessage) read only the first server
 // response and don't wait for or execute client-side fetches, so the
@@ -65,7 +90,6 @@ export async function getServerSideProps({ params }) {
 export default function SharePage({ token, initialStatus, initialData }) {
   const status = initialStatus // ready | not_found | expired
   const data = initialData
-  const [copiedId, setCopiedId] = useState(null)
 
   // Forces a re-render every 30s so the per-lead urgency bars (see
   // UrgencyBar above) actually count down live instead of freezing at
@@ -97,12 +121,6 @@ export default function SharePage({ token, initialStatus, initialData }) {
     track('share_page_viewed', { status, token })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-
-  const handleCopy = (id, text) => {
-    navigator.clipboard.writeText(text)
-    setCopiedId(id)
-    setTimeout(() => setCopiedId(null), 2000)
-  }
 
   const daysRemaining = data
     ? Math.max(1, Math.ceil((new Date(data.expires_at) - new Date()) / (24 * 60 * 60 * 1000)))
@@ -169,13 +187,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
   // whatever they want; nothing is saved until they themselves submit it.
   const signupHref = `/signup?url=${encodeURIComponent(url)}`
 
-  // Echoes the top lead's own subreddit back in the CTA so it reads as a
-  // continuation of what was just read, not a generic ad. Falls back to
-  // plain copy for a zero-qualified scan, where there's no lead to echo.
   const topLead = qualified[0] || closeMatches[0]
-  const ctaCopy = topLead
-    ? `Get notified next time someone in r/${topLead.subreddit} needs this →`
-    : 'Sign up to keep finding leads like this →'
 
   return (
     <>
@@ -235,6 +247,11 @@ export default function SharePage({ token, initialStatus, initialData }) {
                 <p className="leads-sub leads-sub-meta">
                   Scanned {new Date(created_at).toLocaleDateString()} · This specific link expires in {daysRemaining} {daysRemaining === 1 ? 'day' : 'days'}
                 </p>
+                {shareCount > 0 && (
+                  <p className="leads-sub" style={{ fontWeight: 600, color: 'var(--ink)' }}>
+                    Found {shareCount} matching {shareCount === 1 ? 'post' : 'posts'} in this scan.
+                  </p>
+                )}
               </div>
             </div>
 
@@ -275,15 +292,48 @@ export default function SharePage({ token, initialStatus, initialData }) {
                 <div className="draft-box">
                   <div className="draft-header">
                     <span className="draft-label">✍️ Draft Reply</span>
-                    {!lead.replyFailed && (
-                      <button className="copy-btn" onClick={() => handleCopy(lead.id, lead.reply)}>
-                        {copiedId === lead.id ? 'Copied!' : 'Copy'}
-                      </button>
-                    )}
                   </div>
-                  <p className="draft-text" style={lead.replyFailed ? { opacity: 0.55, fontStyle: 'italic' } : undefined}>
-                    {lead.reply}
-                  </p>
+                  {lead.replyFailed ? (
+                    <p className="draft-text" style={{ opacity: 0.55, fontStyle: 'italic' }}>{lead.reply}</p>
+                  ) : (() => {
+                    const { first, rest } = splitFirstSentence(lead.reply)
+                    const timeLeft = formatTimeLeft(lead)
+                    return (
+                      <>
+                        <p className="draft-text">{first}</p>
+                        {rest && (
+                          <>
+                            {/* Visually blurred AND unselectable/non-interactive — a
+                                real gate, not just a style. The old "Copy" button is
+                                gone entirely for a gated reply; there's no control
+                                left anywhere on this card that hands over the full
+                                text without going through signup. */}
+                            <p
+                              className="draft-text"
+                              style={{ filter: 'blur(4px)', userSelect: 'none', pointerEvents: 'none' }}
+                              aria-hidden="true"
+                            >
+                              {rest}
+                            </p>
+                            <div style={{ marginTop: 8 }}>
+                              <Link
+                                href={signupHref}
+                                style={{ fontSize: '0.82rem', fontWeight: 700, color: 'var(--rust)', textDecoration: 'none' }}
+                                onClick={() => track('share_signup_clicked', { source: 'unlock_reply', subreddit: lead.subreddit })}
+                              >
+                                See the rest — free account →
+                              </Link>
+                              <div style={{ fontSize: '0.75rem', color: 'var(--ink-light)', marginTop: 2 }}>
+                                {timeLeft
+                                  ? `Posted ${hoursAgo(lead)} — threads like this usually go quiet within a day.`
+                                  : "This one's a few days old now — newer matches show up with an account."}
+                              </div>
+                            </div>
+                          </>
+                        )}
+                      </>
+                    )
+                  })()}
                 </div>
 
                 <div className="lead-actions">
@@ -337,15 +387,15 @@ export default function SharePage({ token, initialStatus, initialData }) {
                 just getting them to the real signup flow. */}
             <div className="email-gate">
               <div className="email-gate-inner">
-                <h3 className="email-gate-headline">The alternative to this is checking Reddit yourself, every day, by hand.</h3>
-                <p className="email-gate-subheadline">Kairo already found these without anyone searching for them. Point it at your own product and it keeps finding more — automatically, every day.</p>
+                <h3 className="email-gate-headline">Showing one sentence of each reply so you can judge if the match is real.</h3>
+                <p className="email-gate-subheadline">Full replies are account-only — otherwise there's nothing left to come back for. An account also runs this same scan on your own product on a schedule, not just once.</p>
                 <Link
                   href={signupHref}
                   className="ob-scan-btn"
                   style={{ width: '100%', textAlign: 'center', display: 'block', textDecoration: 'none' }}
                   onClick={() => track('share_signup_clicked', { source: 'cta', subreddit: topLead?.subreddit || null })}
                 >
-                  {ctaCopy}
+                  Scan your product →
                 </Link>
                 <p className="email-gate-note">Free to start. No credit card required.</p>
               </div>
@@ -372,7 +422,7 @@ export default function SharePage({ token, initialStatus, initialData }) {
               style={{ textAlign: 'center', textDecoration: 'none', width: '100%', maxWidth: 480 }}
               onClick={() => track('share_signup_clicked', { source: 'sticky_bar', subreddit: topLead?.subreddit || null })}
             >
-              Ready to stop missing these? Sign up →
+              Sign up →
             </Link>
           </div>
         )}
